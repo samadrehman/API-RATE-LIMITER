@@ -1,4 +1,4 @@
-# 🚀 Advanced Rate Limiter + Load Balancer System
+#  Advanced Rate Limiter + Load Balancer System
 
 A production-grade API infrastructure combining:
 - **Rate Limiting** with real-time monitoring
@@ -9,7 +9,7 @@ A production-grade API infrastructure combining:
 - **Real-time Dashboards** for both systems
 
 
-## 📦 Architecture Overview
+##  Architecture Overview
 
 ```
 Internet → Load Balancer (port 8080) → Backend Servers (5001, 5002, 5003)
@@ -21,7 +21,7 @@ Internet → Load Balancer (port 8080) → Backend Servers (5001, 5002, 5003)
 
 
 
-## 🛠️ Setup Instructions
+##  Setup Instructions
 
 ### 1. Install Dependencies
 
@@ -55,9 +55,9 @@ Rate limiter runs on port 5000
 
 ---
 
-## 🎯 Features & Backend Tricks Implemented
+##  Features & Backend Tricks Implemented
 
-### 1. **Load Balancing Strategies**
+###  **Load Balancing Strategies**
 
 #### Round Robin
 - Distributes requests evenly across all backends
@@ -86,17 +86,17 @@ Rate limiter runs on port 5000
   - Failure rate
 - Dynamically adjusts to conditions
 
-### 2. **Health Monitoring**
+###  **Health Monitoring**
 - Automatic health checks every 10 seconds
 - Unhealthy backends removed from rotation
 - Automatic recovery when backend comes back
 
-### 3. **Caching Layer**
+### **Caching Layer**
 - In-memory cache with TTL (Time To Live)
 - Cache hit/miss tracking
 - Reduces backend load by ~30-50%
 
-### 4. **Rate Limiting**
+### **Rate Limiting**
 - Per-IP rate limiting (100 requests/minute)
 - Prevents abuse and DDoS
 - Automatic retry-after headers
@@ -106,12 +106,12 @@ Rate limiter runs on port 5000
 - Prevents backend overload
 - Graceful degradation under load
 
-### 6. **Circuit Breaker Pattern**
+### **Circuit Breaker Pattern**
 - Fails fast when backend is down
 - Automatic retry logic
 - Prevents cascade failures
 
-### 7. **Connection Pooling**
+###  **Connection Pooling**
 - Reuses database connections
 - Reduces overhead
 - Better performance
@@ -121,9 +121,9 @@ Rate limiter runs on port 5000
 - Beautiful dashboards
 - Historical data tracking
 
----
 
-## 🌐 Access Points
+
+## Access Points
 
 ### Load Balancer
 - **Dashboard**: http://localhost:8080/dashboard
@@ -142,7 +142,7 @@ Rate limiter runs on port 5000
 
 ---
 
-## 🧪 Running Tests
+##  Running Tests
 
 ### Test Load Balancer
 ```bash
@@ -173,7 +173,7 @@ This tests:
 
 ---
 
-## 📊 Example Usage
+##  Example Usage
 
 ### Change Load Balancing Strategy
 ```bash
@@ -201,7 +201,7 @@ curl -X POST http://localhost:5000/admin/upgrade_tier \
 
 ---
 
-## 🎨 Dashboard Features
+##  Dashboard Features
 
 ### Load Balancer Dashboard
 - Live backend status
@@ -219,7 +219,7 @@ curl -X POST http://localhost:5000/admin/upgrade_tier \
 
 
 
-## 🔧 Configuration
+##  Configuration
 
 ### Load Balancer (`load_balancer.py`)
 
@@ -258,7 +258,7 @@ BAN_MULTIPLIER = 2  # escalation
 ```
 
 
-## 📈 Performance Benchmarks
+##  Performance Benchmarks
 
 With 3 backends and optimal configuration:
 
@@ -270,39 +270,39 @@ With 3 backends and optimal configuration:
 
 
 
-## 🚨 Production Considerations
+##  Production Considerations
 
 ### Security
-- ✅ Rate limiting per IP
-- ✅ API key authentication
-- ⚠️ Add HTTPS/TLS
-- ⚠️ Secure admin endpoints
-- ⚠️ Add authentication/authorization
+-  Rate limiting per IP
+-  API key authentication
+-  (Not)Add HTTPS/TLS
+-  (Not) Secure admin endpoints
+- (Not) Add authentication/authorization
 
 ### Scalability
-- ✅ Connection pooling
-- ✅ Async operations
-- ⚠️ Use Redis for distributed cache
-- ⚠️ Use message queue (RabbitMQ/Kafka)
-- ⚠️ Horizontal scaling with more load balancers
+- (Done) Connection pooling
+- (Done) Async operations
+- (Not) Use Redis for distributed cache
+- (Not)  Use message queue (RabbitMQ/Kafka)
+- (Not) Horizontal scaling with more load balancers
 
 ### Monitoring
-- ✅ Real-time dashboards
-- ✅ Health checks
-- ⚠️ Add Prometheus/Grafana
-- ⚠️ Error tracking (Sentry)
-- ⚠️ Log aggregation (ELK stack)
+- (Done)  Real-time dashboards
+- (Done) Health checks
+- (Not) Add Prometheus/Grafana
+- (Not)Error tracking (Sentry)
+- (Not) Log aggregation (ELK stack)
 
 ### High Availability
-- ✅ Automatic failover
-- ✅ Health monitoring
-- ⚠️ Multiple load balancer instances
-- ⚠️ Database replication
-- ⚠️ Geographic distribution
+-(Done) Automatic failover
+- (Done) Health monitoring
+- (Not)  Multiple load balancer instances
+- (Not) Database replication
+- (Not) Geographic distribution
 
 
 
-## 🎓 Learning Resources
+## Learning Resources
 
 This project demonstrates:
 
@@ -319,7 +319,7 @@ This project demonstrates:
 
 
 
-## 📝 API Endpoints Reference
+##  API Endpoints Reference
 
 ### Load Balancer Endpoints
 
@@ -344,7 +344,7 @@ This project demonstrates:
 
 
 
-## 🐛 Troubleshooting
+##  Troubleshooting
 
 ### Backend servers won't start
 ```bash
@@ -378,10 +378,10 @@ python app.py  # Recreates database
 - Verify port 8080/5000 is accessible
 
 
-## 🎉 What's Next?
+##  What's Next?
 
 Potential enhancements:
-- [ ] Redis for distributed caching   ----|
+- [ ] Redis for distributed caching   
 - [ ] PostgreSQL for production DB
 - [ ] Docker containers
 - [ ] Kubernetes deployment
@@ -391,9 +391,6 @@ Potential enhancements:
 - [ ] OAuth2 authentication
 - [ ] Rate limit quotas per user
 - [ ] Geographic load balancing
-
-
-## 👨‍💻 Contributing
 
 This is a learning project showcasing enterprise patterns. Feel free to:
 - Fork and experiment
