@@ -1,0 +1,113 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+VENV/
+
+# Databases
+*.db
+*.sqlite3
+ratelimiter.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.nox/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Other
+.DS_Store
+*.log
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+lib/
+lib64/
+*.log
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+lib/
+lib64/
+coverage.xml
+.coverage
+pip-wheel-metadata/
+local_settings.py
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+celerybeat-schedule
+celerybeat.pid
+*.cfg
+*.conf
+notebooks/
+.ipynb_checkpoints
+*~
+# Ignore all log files
+*.log
+logs/
+*.log.*
+
+# Ignore all .env files
+.env
+.env.*
+
+# Ignore databases
+*.db
+*.sqlite3
+
+# Ignore temporary files
+*~
+*.swp
+*.swo
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore Python-specific files
+__pycache__/
+*.py[cod]
+*.so
+.Python
+/dist/
+/build/
+*.egg-info/
+/site/
+
+# Ignore virtual environments
+.venv/
+/venv/
+/env/
+/ENV/
+
+# Ignore IDE files
+.idea/
+.vscode/
+
+# Ignore test-related files
+.pytest_cache/
+.coverage
+
+# Additional files to ignore
+ratelimiter.db.backup
+cert.pem
+key.pem

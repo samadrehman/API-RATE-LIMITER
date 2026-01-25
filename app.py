@@ -9,8 +9,13 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-change-in-production'
+app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
 CORS(app)
 socketio = SocketIO(
     app,
