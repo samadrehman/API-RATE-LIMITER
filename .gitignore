@@ -5,6 +5,8 @@ env/
 venv/
 ENV/
 VENV/
+env.example
+.env.example
 
 # Databases
 *.db

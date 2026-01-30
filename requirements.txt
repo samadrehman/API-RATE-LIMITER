@@ -44,3 +44,4 @@ mypy==1.7.1
 
 uwsgi==2.0.23
 gevent==23.9.1
+bcrypt==4.1.2
