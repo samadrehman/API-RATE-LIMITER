@@ -1568,6 +1568,7 @@ if __name__ == '__main__':
         app,
         debug=Config.DEBUG,
         host='0.0.0.0',
-        port=5000,
+        port=int(os.getenv('PORT', 5000)),
+        
         allow_unsafe_werkzeug=True  # Only for development
     )
