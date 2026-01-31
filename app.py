@@ -86,7 +86,8 @@ load_dotenv()
 
 class Config:
     """Application configuration with secure defaults"""
-    
+
+
     # Security
     SECRET_KEY = os.getenv('JWT_SECRET_KEY')
     ADMIN_TOKEN = os.getenv('ADMIN_TOKEN')
@@ -1538,7 +1539,7 @@ def cleanup_task():
     cleanup_thread.start()
 
 
-@app.before_first_request
+@app.before_request
 def startup_tasks():
     """Tasks to run on application startup"""
     cleanup_task()
