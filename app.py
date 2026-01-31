@@ -79,6 +79,10 @@ import bcrypt
 
 import os
 from dotenv import load_dotenv
+# Import at top of file
+from auth import JWTAuthManager
+
+
 
 load_dotenv()
 
@@ -144,6 +148,15 @@ socketio = SocketIO(
     async_mode=Config.SOCKETIO_ASYNC_MODE,
     max_http_buffer_size=Config.MAX_CONTENT_LENGTH
 )
+
+# Add after socketio initialization
+jwt_manager = JWTAuthManager(
+    secret_key=Config.SECRET_KEY,
+    access_token_expiry=3600,
+    refresh_token_expiry=604800
+)
+jwt_manager.init_auth_endpoints(app)
+app.config['JWT_MANAGER'] = jwt_manager
 
 
 # DATABASE CONNECTION POOL
