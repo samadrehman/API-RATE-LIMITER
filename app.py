@@ -61,7 +61,6 @@ Version: 2.0.0 (Security Enhanced)
 Last Updated: 2025
 License: MIT
 """
-
 import sqlite3
 import time
 import json
@@ -79,9 +78,7 @@ import bcrypt
 
 import os
 from dotenv import load_dotenv
-# Import at top of file
 from auth import JWTAuthManager
-
 
 
 load_dotenv()
