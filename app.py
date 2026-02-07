@@ -143,28 +143,19 @@ socketio = SocketIO(
 )
 
 
-from auth import JWTAuthManager
-
 jwt_manager = JWTAuthManager(
     secret_key=Config.SECRET_KEY,
     algorithm="HS256"
 )
 
 jwt_manager.init_auth_endpoints(app)
+app.config["JWT_MANAGER"] = jwt_manager
 
-app.config['JWT_MANAGER'] = jwt_manager
 
 print("✅ JWT Authentication initialized")
 print("📝 Auth endpoints registered: /auth/register, /auth/login, /auth/refresh")
 
-# Add after socketio initialization
-jwt_manager = JWTAuthManager(
-    secret_key=Config.SECRET_KEY,
-    access_token_expiry=3600,
-    refresh_token_expiry=604800
-)
-jwt_manager.init_auth_endpoints(app)
-app.config['JWT_MANAGER'] = jwt_manager
+
 
 
 # DATABASE CONNECTION POOL
