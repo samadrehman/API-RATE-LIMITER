@@ -1257,6 +1257,25 @@ def get_data():
     if status == 429 and "retry_after_seconds" in body:
         headers["Retry-After"] = str(body["retry_after_seconds"])
 
+    headers = {}
+
+    if api_key:
+        user = get_or_create_user(api_key)
+    if user:
+        tier = user['tier']
+        limits = Config.RATE_LIMITS[tier]
+        headers.update({
+            "X-RateLimit-Limit": str(limits['requests']),
+            "X-RateLimit-Remaining": str(
+                max(0, limits['requests'] - user['request_count'])
+            ),
+            "X-RateLimit-Window": str(limits['window'])
+        })
+
+    if status == 429 and "retry_after_seconds" in body:
+        headers["Retry-After"] = str(body["retry_after_seconds"])
+
+
     return jsonify(body), status, headers
 
 
