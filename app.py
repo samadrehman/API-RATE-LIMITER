@@ -147,7 +147,6 @@ jwt_manager = JWTAuthManager(
     secret_key=Config.SECRET_KEY,
     algorithm="HS256"
 )
-
 jwt_manager.init_auth_endpoints(app)
 app.config["JWT_MANAGER"] = jwt_manager
 
