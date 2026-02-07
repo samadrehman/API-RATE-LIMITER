@@ -63,7 +63,7 @@ License: MIT
 """
 import sqlite3
 import time
-from flask import send_file  
+from flask import g, send_file  
 import secrets
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -1008,6 +1008,34 @@ DASHBOARD_HTML = '''
 # SDK API ROUTES - CORRECTED VERSION
 # Add these to app.py around line 998 (after root route)
 # =============================================================================
+
+import secrets
+
+@app.route('/auth/create_api_key', methods=['POST'])
+def create_api_key():
+    user_id = request.g.user['user_id']  # from JWT
+
+    api_key = "rk_" + secrets.token_urlsafe(32)
+    api_key_hash = SecurityUtils.hash_api_key(api_key)
+    api_key_prefix = SecurityUtils.get_api_key_prefix(api_key)
+
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (api_key_hash, api_key_prefix, tier)
+        VALUES (?, ?, 'free')
+    """, (api_key_hash, api_key_prefix))
+
+    conn.commit()
+    db_pool.return_connection(conn)
+
+    return jsonify({
+        "api_key": api_key,
+        "tier": "free",
+        "warning": "Save this key now. You will not see it again."
+    }), 201
+
 
 @app.route('/sdk.js')
 def serve_sdk():
