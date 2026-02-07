@@ -4,4 +4,4 @@ builder = "nixpacks"
 [deploy]
 startCommand = "gunicorn app:app --worker-class gthread --threads 4 --workers 2 --bind 0.0.0.0:$PORT"
 restartPolicyType = "on_failure"
-restartPolicyMaxRetries = never
+restartPolicyMaxRetries = 0
