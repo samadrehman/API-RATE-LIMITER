@@ -130,6 +130,53 @@ class Config:
 
 # FLASK APPLICATION SETUP
 
+from functools import wraps
+from flask import request, jsonify, g
+import jwt
+import os
+
+def require_jwt_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization")
+
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return jsonify({
+                "error": "Unauthorized",
+                "message": "Authorization: Bearer <token> required"
+            }), 401
+
+        token = auth_header.split(" ", 1)[1]
+
+        try:
+            payload = jwt.decode(
+                token,
+                os.getenv("JWT_SECRET_KEY"),
+                algorithms=["HS256"]
+            )
+
+            if payload.get("type") != "access":
+                return jsonify({
+                    "error": "Invalid token type"
+                }), 401
+
+            # Attach user to request context
+            g.user = {
+                "user_id": payload.get("user_id"),
+                "tier": payload.get("tier"),
+                "metadata": payload.get("metadata", {})
+            }
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+
+        return f(*args, **kwargs)
+
+    return decorated
+
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = Config.SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
@@ -1010,6 +1057,40 @@ DASHBOARD_HTML = '''
 # =============================================================================
 
 import secrets
+import secrets
+
+@app.route('/auth/api-key', methods=['POST'])
+@require_jwt_auth
+def create_api_key():
+    user_id = g.user['user_id']  # from JWT middleware
+
+    api_key = "rk_" + secrets.token_urlsafe(32)
+    api_key_hash = SecurityUtils.hash_api_key(api_key)
+    api_key_prefix = SecurityUtils.get_api_key_prefix(api_key)
+
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (
+            api_key_hash,
+            api_key_prefix,
+            tier,
+            request_count,
+            total_requests,
+            blocked
+        ) VALUES (?, ?, 'free', 0, 0, 0)
+    """, (api_key_hash, api_key_prefix))
+
+    conn.commit()
+    db_pool.return_connection(conn)
+
+    return jsonify({
+        "api_key": api_key,
+        "tier": "free",
+        "note": "Save this key now. It will not be shown again."
+    }), 201
+
 
 @app.route('/auth/create_api_key', methods=['POST'])
 def create_api_key():
