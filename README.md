@@ -454,7 +454,6 @@ BAN_MULTIPLIER = 2  # escalation
 
 ```python
 # Token expiration
-access_token_expiry = 3600  # 1 hour
 refresh_token_expiry = 604800  # 7 days
 
 # Algorithm

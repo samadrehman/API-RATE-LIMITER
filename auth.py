@@ -73,7 +73,6 @@ class JWTAuthManager:
             raise ValueError("Secret key must be at least 32 characters for security")
         
         # Token expiration times in seconds
-        self.access_token_expiry = 3600      # 1 hour
         self.refresh_token_expiry = 604800   # 7 days (not 600 seconds!)
         
         # Token blacklist for revocation (in production, use Redis)
@@ -84,7 +83,6 @@ class JWTAuthManager:
         print(f"✅ JWT Manager initialized")
         print(f"🔑 Secret key: {self.secret_key[:8]}...***KEEP SECRET***")
         print(f"🔐 Algorithm: {self.algorithm}")
-        print(f"⏱️  Access token expiry: {self.access_token_expiry}s")
         print(f"⏱️  Refresh token expiry: {self.refresh_token_expiry}s")
     
     def generate_tokens(
@@ -110,7 +108,6 @@ class JWTAuthManager:
             'user_id': user_id,
             'tier': tier,
             'iat': now,  # Issued at
-            'exp': now + timedelta(seconds=self.access_token_expiry),  # Expiration
             'type': 'access',
             'metadata': metadata or {},
             'jti': secrets.token_hex(16),  # Unique token ID for revocation
@@ -141,7 +138,6 @@ class JWTAuthManager:
         return {
             'access_token': access_token,
             'refresh_token': refresh_token,
-            'access_token_expiry': self.access_token_expiry,
             'refresh_token_expiry': self.refresh_token_expiry,
             'token_type': 'Bearer',
             'user_id': user_id,
