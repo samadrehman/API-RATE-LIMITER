@@ -176,6 +176,25 @@ def require_jwt_auth(f):
 
     return decorated
 
+import secrets
+import hashlib
+
+def create_user_api_key(user_id: str) -> str:
+    """
+    Generates a secure API key for a user
+    """
+    raw_key = secrets.token_urlsafe(32)
+    hashed_key = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    # TODO: save hashed_key + user_id in DB
+    # Example:
+    # db.api_keys.insert_one({
+    #     "user_id": user_id,
+    #     "key_hash": hashed_key,
+    #     "tier": "free"
+    # })
+
+    return raw_key
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = Config.SECRET_KEY
@@ -1057,30 +1076,24 @@ DASHBOARD_HTML = '''
 # =============================================================================
 
 import secrets
-
 @app.route('/auth/create_api_key', methods=['POST'])
+@require_jwt_auth
 def create_api_key():
-    user_id = request.g.user['user_id']  # from JWT
+    user_id = g.user["user_id"]
 
-    api_key = "rk_" + secrets.token_urlsafe(32)
-    api_key_hash = SecurityUtils.hash_api_key(api_key)
-    api_key_prefix = SecurityUtils.get_api_key_prefix(api_key)
+    # generate key
+    api_key = SecurityUtils.generate_api_key()  # rk_live_xxx
 
-    conn = db_pool.get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO users (api_key_hash, api_key_prefix, tier)
-        VALUES (?, ?, 'free')
-    """, (api_key_hash, api_key_prefix))
-
-    conn.commit()
-    db_pool.return_connection(conn)
+    # store key mapped to user
+    create_user_api_key(
+        user_id=user_id,
+        api_key=api_key,
+        tier=g.user.get("tier", "free")
+    )
 
     return jsonify({
         "api_key": api_key,
-        "tier": "free",
-        "warning": "Save this key now. You will not see it again."
+        "tier": g.user.get("tier", "free")
     }), 201
 
 
