@@ -1057,40 +1057,6 @@ DASHBOARD_HTML = '''
 # =============================================================================
 
 import secrets
-import secrets
-
-@app.route('/auth/api-key', methods=['POST'])
-@require_jwt_auth
-def create_api_key():
-    user_id = g.user['user_id']  # from JWT middleware
-
-    api_key = "rk_" + secrets.token_urlsafe(32)
-    api_key_hash = SecurityUtils.hash_api_key(api_key)
-    api_key_prefix = SecurityUtils.get_api_key_prefix(api_key)
-
-    conn = db_pool.get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO users (
-            api_key_hash,
-            api_key_prefix,
-            tier,
-            request_count,
-            total_requests,
-            blocked
-        ) VALUES (?, ?, 'free', 0, 0, 0)
-    """, (api_key_hash, api_key_prefix))
-
-    conn.commit()
-    db_pool.return_connection(conn)
-
-    return jsonify({
-        "api_key": api_key,
-        "tier": "free",
-        "note": "Save this key now. It will not be shown again."
-    }), 201
-
 
 @app.route('/auth/create_api_key', methods=['POST'])
 def create_api_key():
