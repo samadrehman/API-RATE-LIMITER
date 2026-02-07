@@ -63,7 +63,7 @@ License: MIT
 """
 import sqlite3
 import time
-import json
+from flask import send_file  
 import secrets
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -117,17 +117,13 @@ class Config:
     TEMP_BAN_SECONDS = int(os.getenv('TEMP_BAN_SECONDS', '300'))
     BAN_MULTIPLIER = float(os.getenv('BAN_MULTIPLIER', '2'))
     
-    # CORS - Configure specific origins in production
-    CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:3000,http://localhost:5000').split(',')
+    CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
     
-    # Request Limits
     MAX_CONTENT_LENGTH = int(os.getenv('MAX_CONTENT_LENGTH', str(16 * 1024)))  # 16KB
     MAX_LOG_ENTRIES = int(os.getenv('MAX_LOG_ENTRIES', '1000'))
     
-    # WebSocket
     SOCKETIO_ASYNC_MODE = os.getenv('SOCKETIO_ASYNC_MODE', 'threading')
     
-    # Environment
     FLASK_ENV = os.getenv('FLASK_ENV', 'development')
     DEBUG = FLASK_ENV == 'development'
 
@@ -145,6 +141,22 @@ socketio = SocketIO(
     async_mode=Config.SOCKETIO_ASYNC_MODE,
     max_http_buffer_size=Config.MAX_CONTENT_LENGTH
 )
+
+
+from auth import JWTAuthManager
+
+jwt_manager = JWTAuthManager(
+    secret_key=Config.SECRET_KEY,
+    access_token_expiry=3600,  # 1 hour
+    refresh_token_expiry=604800  # 7 days
+)
+
+jwt_manager.init_auth_endpoints(app)
+
+app.config['JWT_MANAGER'] = jwt_manager
+
+print("✅ JWT Authentication initialized")
+print("📝 Auth endpoints registered: /auth/register, /auth/login, /auth/refresh")
 
 # Add after socketio initialization
 jwt_manager = JWTAuthManager(
@@ -1003,8 +1015,166 @@ DASHBOARD_HTML = '''
 </html>
 '''
 
+# =============================================================================
+# SDK API ROUTES - CORRECTED VERSION
+# Add these to app.py around line 998 (after root route)
+# =============================================================================
 
-# API ROUTES
+@app.route('/sdk.js')
+def serve_sdk():
+    """Serve the SDK JavaScript file to customers"""
+    try:
+        return send_file('static/ratelimiter-sdk.js', mimetype='application/javascript')
+    except FileNotFoundError:
+        return jsonify({'error': 'SDK file not found'}), 404
+
+
+@app.route('/sdk/check', methods=['POST'])
+def sdk_check():
+    """
+    Check if a request is allowed based on rate limits
+    Called by the SDK before customer makes their API request
+    """
+    try:
+        data = request.get_json()
+        api_key = data.get('api_key')
+        endpoint = data.get('endpoint', 'unknown')
+        method = data.get('method', 'GET')
+        
+        if not api_key:
+            return jsonify({
+                'allowed': False,
+                'error': 'API key required',
+                'remaining': 0
+            }), 400
+        
+        # Use YOUR EXISTING is_key_allowed function
+        key_ok, key_info = is_key_allowed(api_key)
+        
+        if key_ok:
+            # Get user info to return remaining requests
+            user = get_or_create_user(api_key)
+            if user:
+                tier = user.get('tier', 'free')
+                limits = Config.RATE_LIMITS.get(tier, Config.RATE_LIMITS['free'])
+                current_count = user.get('request_count', 0)
+                
+                return jsonify({
+                    'allowed': True,
+                    'remaining': limits['requests'] - current_count,
+                    'limit': limits['requests'],
+                    'window_seconds': limits['window'],
+                    'tier': tier,
+                    'reset_at': (datetime.now() + timedelta(seconds=limits['window'])).isoformat()
+                }), 200
+            else:
+                return jsonify({
+                    'allowed': True,
+                    'remaining': 5,
+                    'limit': 5,
+                    'tier': 'free'
+                }), 200
+        
+        else:
+            # Rate limited - get tier info for message
+            user = get_or_create_user(api_key)
+            tier = user.get('tier', 'free') if user else 'free'
+            limits = Config.RATE_LIMITS.get(tier, Config.RATE_LIMITS['free'])
+            
+            # Extract retry_after from key_info
+            retry_after = limits['window']
+            if isinstance(key_info, (int, float)):
+                retry_after = int(key_info)
+            elif isinstance(key_info, dict) and 'retry_after' in key_info:
+                retry_after = key_info['retry_after']
+            
+            return jsonify({
+                'allowed': False,
+                'remaining': 0,
+                'limit': limits['requests'],
+                'window_seconds': limits['window'],
+                'tier': tier,
+                'retry_after': retry_after,
+                'message': 'Rate limit exceeded',
+                'reset_at': (datetime.now() + timedelta(seconds=retry_after)).isoformat()
+            }), 429
+    
+    except Exception as e:
+        print(f"SDK check error: {e}")
+        return jsonify({
+            'allowed': False,
+            'error': 'Internal server error',
+            'remaining': 0
+        }), 500
+
+
+@app.route('/sdk/track', methods=['POST'])
+def sdk_track():
+    """
+    Track SDK usage for analytics (optional)
+    Logs requests made through the SDK
+    """
+    try:
+        data = request.get_json()
+        api_key = data.get('api_key')
+        endpoint = data.get('endpoint', 'unknown')
+        method = data.get('method', 'GET')
+        status_code = data.get('status_code', 200)
+        response_time = data.get('response_time_ms', 0)
+        
+        if not api_key:
+            return jsonify({'error': 'API key required'}), 400
+        
+        log_request(
+            api_key=api_key,
+            endpoint=f"SDK:{endpoint}",
+            method=method,
+            status_code=status_code,
+            ip=request.remote_addr,
+            user_agent=request.headers.get('User-Agent', ''),
+            response_time_ms=response_time
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Request tracked'
+        }), 200
+    
+    except Exception as e:
+        print(f"SDK track error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Failed to track request'
+        }), 500
+
+
+def get_user_info(api_key: str) -> Optional[Dict]:
+    """Get user information by API key"""
+    try:
+        with db_pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT api_key, tier, request_count, window_start_time, 
+                       blocked, banned_until, total_requests
+                FROM users 
+                WHERE api_key = ?
+            ''', (api_key,))
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'api_key': row[0],
+                    'tier': row[1],
+                    'request_count': row[2],
+                    'window_start_time': row[3],
+                    'blocked': row[4],
+                    'banned_until': row[5],
+                    'total_requests': row[6]
+                }
+            return None
+    except Exception as e:
+        print(f"Error getting user info: {e}")
+        return None
 
 @app.route('/')
 def home():
