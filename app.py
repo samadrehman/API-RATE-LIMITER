@@ -147,8 +147,7 @@ from auth import JWTAuthManager
 
 jwt_manager = JWTAuthManager(
     secret_key=Config.SECRET_KEY,
-    access_token_expiry=3600,  # 1 hour
-    refresh_token_expiry=604800  # 7 days
+    algorithm="HS256"
 )
 
 jwt_manager.init_auth_endpoints(app)
