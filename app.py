@@ -38,7 +38,8 @@ class Config:
     ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'dev-admin-token-change-me')
     
     # Database
-    DATABASE_URL = os.getenv('DATABASE_URL')
+    DATABASE_URL = os.getenv('DATABASE_URL')  
+    DB_PATH = os.getenv('DB_PATH', 'ratelimiter.db')  
     DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
     
     # Rate Limiting
