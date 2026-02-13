@@ -38,7 +38,7 @@ class Config:
     ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'dev-admin-token-change-me')
     
     # Database
-    DB_PATH = os.getenv('DB_PATH', 'ratelimiter.db')
+    DATABASE_URL = os.getenv('DATABASE_URL')
     DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
     
     # Rate Limiting
@@ -304,19 +304,19 @@ def ensure_db_schema() -> None:
         # Auth users table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS auth_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 user_id TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 tier TEXT DEFAULT 'free',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT NOW()
             )
         """)
         
         # Users table (API keys)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 api_key_hash TEXT UNIQUE NOT NULL,
                 api_key_prefix TEXT NOT NULL,
                 user_id TEXT,
@@ -327,14 +327,14 @@ def ensure_db_schema() -> None:
                 tier TEXT DEFAULT 'free',
                 total_requests INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
         
         # Logs table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 api_key_prefix TEXT,
                 endpoint TEXT NOT NULL,
                 method TEXT DEFAULT 'GET',
@@ -342,30 +342,30 @@ def ensure_db_schema() -> None:
                 ip_hash TEXT,
                 user_agent TEXT,
                 response_time_ms INTEGER,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT NOW()
             )
         """)
         
         # Analytics table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 metric_type TEXT NOT NULL,
                 metric_value REAL,
                 metadata TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT NOW()
             )
         """)
         
         # Admin audit table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admin_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 action TEXT NOT NULL,
                 target_api_key_prefix TEXT,
                 admin_ip_hash TEXT,
                 details TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT NOW()
             )
         """)
         
