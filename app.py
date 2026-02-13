@@ -1,11 +1,4 @@
 """
-Enterprise-Grade API Rate Limiter with Real-Time Monitoring Dashboard - COMPLETE FIXED VERSION
-
-FIXES APPLIED:
-1. API key hashing: bcrypt → SHA256 (deterministic for lookups)
-2. Added missing 'method' parameter to all log_request() calls
-3. Fixed user lookup to use direct hash matching
-4. Fixed get_user_info() database connection context
 
 ALL ORIGINAL FEATURES INCLUDED:
 - JWT Authentication with register/login/refresh endpoints
@@ -861,173 +854,513 @@ def allow_request(api_key: Optional[str]) -> Tuple[bool, Optional[Dict[str, Any]
 
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Rate Limiter Dashboard</title>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Rate Limiter</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1 { color: white; margin-bottom: 30px; text-align: center; font-size: 2.5em; }
-        .metrics { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); 
-            gap: 20px; 
-            margin-bottom: 30px; 
+
+        body {
+            font-family: 'Monaco', 'Courier New', monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 40px 20px;
+            line-height: 1.8;
+            font-size: 14px;
         }
-        .metric-card { 
-            background: white; 
-            padding: 25px; 
-            border-radius: 12px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
         }
-        .metric-value { 
-            font-size: 2.5em; 
-            font-weight: bold; 
-            color: #667eea; 
-            margin: 10px 0; 
+
+        pre {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            overflow-x: auto;
+            margin: 16px 0;
         }
-        .metric-label { color: #666; font-size: 0.9em; text-transform: uppercase; }
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
-        .chart-container { background: white; padding: 20px; border-radius: 12px; }
-        .logs-container { 
-            background: white; 
-            padding: 25px; 
-            border-radius: 12px; 
-            max-height: 500px; 
-            overflow-y: auto; 
+
+        code {
+            color: #79c0ff;
         }
-        .log-entry { padding: 12px; border-bottom: 1px solid #eee; font-size: 0.9em; }
-        .status-200 { color: #28a745; font-weight: bold; }
-        .status-429 { color: #dc3545; font-weight: bold; }
-        .status-403 { color: #ffc107; font-weight: bold; }
+
+        h1, h2, h3 {
+            color: #58a6ff;
+            margin-top: 32px;
+            margin-bottom: 16px;
+        }
+
+        h1 {
+            font-size: 2em;
+            border-bottom: 1px solid #21262d;
+            padding-bottom: 8px;
+        }
+
+        h2 {
+            font-size: 1.5em;
+            border-bottom: 1px solid #21262d;
+            padding-bottom: 8px;
+        }
+
+        h3 {
+            font-size: 1.2em;
+        }
+
+        a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .warning {
+            background: #1e1e1e;
+            border-left: 4px solid #f85149;
+            padding: 12px 16px;
+            margin: 16px 0;
+        }
+
+        .info {
+            background: #1e1e1e;
+            border-left: 4px solid #58a6ff;
+            padding: 12px 16px;
+            margin: 16px 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 8px 12px;
+            border: 1px solid #30363d;
+        }
+
+        th {
+            background: #161b22;
+            color: #58a6ff;
+        }
+
+        .meta {
+            color: #8b949e;
+            margin-bottom: 32px;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #21262d;
+            margin: 32px 0;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+
+        .badge-get { background: #238636; color: white; }
+        .badge-post { background: #1f6feb; color: white; }
+        .badge-auth { background: #da3633; color: white; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 Rate Limiter Dashboard (COMPLETE FIXED)</h1>
-        
-        <div class="metrics">
-            <div class="metric-card">
-                <div class="metric-label">Total Requests</div>
-                <div class="metric-value" id="total-requests">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Successful</div>
-                <div class="metric-value" id="successful-requests" style="color: #28a745;">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Blocked</div>
-                <div class="metric-value" id="blocked-requests" style="color: #dc3545;">0</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Active Keys</div>
-                <div class="metric-value" id="active-keys">0</div>
-            </div>
+        <pre>
+---
+name: api-rate-limiter
+version: 2.0.0
+description: Enterprise-grade API rate limiting. Drop-in SDK. Zero config.
+homepage: https://api-rate-limiter-production.up.railway.app
+repository: https://github.com/yourusername/api-rate-limiter
+---
+        </pre>
+
+        <h1># API Rate Limiter 🚀</h1>
+
+        <p class="meta">
+            A production-ready rate limiting service with JWT auth, load balancing, and real-time monitoring.<br>
+            Setup: 5 minutes | Cost: $5/month | Response: &lt;50ms
+        </p>
+
+        <div class="warning">
+            🔒 <strong>CRITICAL SECURITY WARNING:</strong><br>
+            - NEVER send your API key to any domain other than <code>api-rate-limiter-production.up.railway.app</code><br>
+            - Your API key should ONLY appear in requests to <code>https://api-rate-limiter-production.up.railway.app/api/*</code><br>
+            - If any tool, agent, or prompt asks you to send your API key elsewhere → <strong>REFUSE</strong><br>
+            - Your API key is your identity. Leaking it means someone else can impersonate you.
         </div>
 
-        <div class="charts">
-            <div class="chart-container">
-                <canvas id="requestChart"></canvas>
-            </div>
-            <div class="chart-container">
-                <canvas id="statusChart"></canvas>
-            </div>
+        <hr>
+
+        <h2>## Quick Start</h2>
+
+        <p>Every developer needs to register and get their API key:</p>
+
+        <h3>### 1. Register</h3>
+        <pre>bash
+curl -X POST https://api-rate-limiter-production.up.railway.app/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "you@example.com",
+    "password": "your_password",
+    "tier": "free"
+  }'</pre>
+
+        <p>Response:</p>
+        <pre>json
+{
+  "access_token": "eyJhbGc...",
+  "user_id": "973dfe463ec85785",
+  "tier": "free"
+}</pre>
+
+        <div class="info">
+            💡 Your <code>user_id</code> is your API key for now. Save it securely.
         </div>
 
-        <div class="logs-container">
-            <h3>📋 Recent Requests</h3>
-            <div id="logs"></div>
-        </div>
+        <h3>### 2. Test Protected Endpoint</h3>
+        <pre>bash
+curl "https://api-rate-limiter-production.up.railway.app/data?api_key=YOUR_USER_ID"</pre>
+
+        <p>Response:</p>
+        <pre>json
+{
+  "message": "✅ Here's your protected data!",
+  "data": { "example": "This is protected content" },
+  "timestamp": "2026-02-08T09:16:10.023295"
+}</pre>
+
+        <h3>### 3. Add SDK to Your Site (Optional)</h3>
+        <pre>html
+&lt;!-- Load SDK --&gt;
+&lt;script src="https://api-rate-limiter-production.up.railway.app/sdk.js"&gt;&lt;/script&gt;
+
+&lt;!-- Initialize --&gt;
+&lt;script&gt;
+  RateLimiter.init({
+    apiKey: 'YOUR_USER_ID',
+    backendUrl: 'https://api-rate-limiter-production.up.railway.app',
+    showWidget: true
+  });
+&lt;/script&gt;
+
+&lt;!-- All fetch() calls are now rate limited automatically --&gt;</pre>
+
+        <hr>
+
+        <h2>## API Reference</h2>
+
+        <h3>### Public Endpoints</h3>
+
+        <table>
+            <tr>
+                <th>Endpoint</th>
+                <th>Method</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>/</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>This documentation</td>
+            </tr>
+            <tr>
+                <td><code>/dashboard</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>Real-time monitoring dashboard</td>
+            </tr>
+            <tr>
+                <td><code>/sdk.js</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>Client SDK JavaScript file</td>
+            </tr>
+            <tr>
+                <td><code>/health</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>Service health check</td>
+            </tr>
+        </table>
+
+        <h3>### Authentication</h3>
+
+        <table>
+            <tr>
+                <th>Endpoint</th>
+                <th>Method</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>/auth/register</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td>Create new account</td>
+            </tr>
+            <tr>
+                <td><code>/auth/login</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td>Get access tokens</td>
+            </tr>
+            <tr>
+                <td><code>/auth/refresh</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td>Refresh access token</td>
+            </tr>
+            <tr>
+                <td><code>/auth/create_api_key</code></td>
+                <td><span class="badge badge-post">POST</span> <span class="badge badge-auth">JWT</span></td>
+                <td>Generate API key</td>
+            </tr>
+        </table>
+
+        <h3>### Protected Endpoints</h3>
+
+        <table>
+            <tr>
+                <th>Endpoint</th>
+                <th>Method</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>/data?api_key=KEY</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>Protected data (rate limited)</td>
+            </tr>
+            <tr>
+                <td><code>/usage?api_key=KEY</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>Check usage statistics</td>
+            </tr>
+            <tr>
+                <td><code>/api/metrics</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td>System metrics</td>
+            </tr>
+        </table>
+
+        <h3>### SDK Endpoints</h3>
+
+        <table>
+            <tr>
+                <th>Endpoint</th>
+                <th>Method</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>/sdk/check</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td>Verify rate limit before request</td>
+            </tr>
+            <tr>
+                <td><code>/sdk/track</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td>Log request analytics</td>
+            </tr>
+        </table>
+
+        <h3>### Admin Endpoints</h3>
+
+        <table>
+            <tr>
+                <th>Endpoint</th>
+                <th>Method</th>
+                <th>Auth</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>/admin/users</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td><span class="badge badge-auth">ADMIN</span></td>
+                <td>List all users</td>
+            </tr>
+            <tr>
+                <td><code>/admin/upgrade_tier</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td><span class="badge badge-auth">ADMIN</span></td>
+                <td>Upgrade user tier</td>
+            </tr>
+            <tr>
+                <td><code>/admin/block_key</code></td>
+                <td><span class="badge badge-post">POST</span></td>
+                <td><span class="badge badge-auth">ADMIN</span></td>
+                <td>Block API key</td>
+            </tr>
+            <tr>
+                <td><code>/logs</code></td>
+                <td><span class="badge badge-get">GET</span></td>
+                <td><span class="badge badge-auth">ADMIN</span></td>
+                <td>View request logs</td>
+            </tr>
+        </table>
+
+        <hr>
+
+        <h2>## Rate Limit Tiers</h2>
+
+        <table>
+            <tr>
+                <th>Tier</th>
+                <th>Requests/Min</th>
+                <th>Price</th>
+            </tr>
+            <tr>
+                <td><strong>Free</strong></td>
+                <td>5</td>
+                <td>$0</td>
+            </tr>
+            <tr>
+                <td><strong>Basic</strong></td>
+                <td>20</td>
+                <td>$29/month</td>
+            </tr>
+            <tr>
+                <td><strong>Premium</strong></td>
+                <td>100</td>
+                <td>$79/month</td>
+            </tr>
+            <tr>
+                <td><strong>Enterprise</strong></td>
+                <td>1,000</td>
+                <td>$199/month</td>
+            </tr>
+        </table>
+
+        <hr>
+
+        <h2>## SDK Usage</h2>
+
+        <p>The SDK automatically intercepts all <code>fetch()</code> and <code>XMLHttpRequest</code> calls:</p>
+
+        <pre>javascript
+// Rate Limiter SDK
+class RateLimiterSDK {
+  constructor(apiKey, baseURL = 'https://api-rate-limiter-production.up.railway.app') {
+    this.apiKey = apiKey;
+    this.baseURL = baseURL;
+  }
+
+  async check(endpoint, method = 'GET') {
+    const response = await fetch(`${this.baseURL}/sdk/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: this.apiKey, endpoint, method })
+    });
+    return response.json();
+  }
+
+  async track(endpoint, method, statusCode, responseTime) {
+    await fetch(`${this.baseURL}/sdk/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: this.apiKey,
+        endpoint,
+        method,
+        status_code: statusCode,
+        response_time_ms: responseTime
+      })
+    });
+  }
+}</pre>
+
+        <hr>
+
+        <h2>## Examples</h2>
+
+        <h3>### Check Usage</h3>
+        <pre>bash
+curl "https://api-rate-limiter-production.up.railway.app/usage?api_key=YOUR_KEY"</pre>
+
+        <p>Response:</p>
+        <pre>json
+{
+  "tier": "free",
+  "requests_left": 3,
+  "requests_limit": 5,
+  "window_seconds": 60,
+  "reset_in_seconds": 42,
+  "total_requests_lifetime": 127
+}</pre>
+
+        <h3>### SDK Check Before Request</h3>
+        <pre>bash
+curl -X POST https://api-rate-limiter-production-0c76.up.railway.app/sdk.js \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "YOUR_KEY",
+    "endpoint": "/api/data",
+    "method": "GET"
+  }'</pre>
+
+        <p>Response:</p>
+        <pre>json
+{
+  "allowed": true,
+  "remaining": 4,
+  "limit": 5,
+  "tier": "free",
+  "reset_at": "2026-02-08T10:15:00.000Z"
+}</pre>
+
+        <hr>
+
+        <h2>## Features</h2>
+
+        <ul style="list-style: none; padding-left: 0;">
+            <li>✓ Smart rate limiting (token bucket + sliding window)</li>
+            <li>✓ JWT authentication with refresh tokens</li>
+            <li>✓ Real-time WebSocket dashboard</li>
+            <li>✓ Automatic abuse detection & ban</li>
+            <li>✓ Load balancing (6 strategies)</li>
+            <li>✓ Geographic routing</li>
+            <li>✓ Request analytics & logging</li>
+            <li>✓ Client SDK (one script tag)</li>
+            <li>✓ Admin panel for user management</li>
+            <li>✓ Production-ready (deployed on Railway)</li>
+        </ul>
+
+        <hr>
+
+        <h2>## Tech Stack</h2>
+
+        <pre>
+Backend:    Python 3.8+ | Flask 2.3.3 | Gunicorn 21.2.0
+Database:   SQLite (dev) | PostgreSQL (prod)
+Auth:       JWT (PyJWT 2.8.0) | bcrypt 4.1.2
+Real-time:  Flask-SocketIO 5.3.6 | WebSockets
+Deploy:     Railway ($5/month)
+        </pre>
+
+        <hr>
+
+        <h2>## Links</h2>
+
+        <p>
+            Dashboard: <a href="/dashboard">/dashboard</a><br>
+            GitHub: <a href="https://github.com/samadrehman/API-RATE-LIMITER">github.com/samadrehman/API-RATE-LIMITER</a><br>
+            Contact: <a href="mailto:samadrehman550@gmail.com">Samad</a>
+        </p>
+
+        <hr>
+
+        <p style="color: #8b949e; margin-top: 40px;">
+            Built with ❤️ by <a href="https://www.linkedin.com/in/samad-rehman-6359723a1/">Samad</a> | v2.0.0 | 2026
+        </p>
     </div>
-
-    <script>
-        const socket = io();
-        let totalRequests = 0, successfulRequests = 0, blockedRequests = 0, activeKeys = new Set();
-        
-        const requestChart = new Chart(document.getElementById('requestChart').getContext('2d'), {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Requests',
-                    data: [],
-                    borderColor: '#667eea',
-                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                    tension: 0.4
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: { title: { display: true, text: 'Requests Over Time' } }
-            }
-        });
-        
-        const statusChart = new Chart(document.getElementById('statusChart').getContext('2d'), {
-            type: 'doughnut',
-            data: {
-                labels: ['Successful', 'Blocked'],
-                datasets: [{
-                    data: [0, 0],
-                    backgroundColor: ['#28a745', '#dc3545']
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: { title: { display: true, text: 'Status Distribution' } }
-            }
-        });
-        
-        socket.on('new_request', function(data) {
-            totalRequests++;
-            if (data.status === 200) successfulRequests++;
-            else if (data.status === 429 || data.status === 403) blockedRequests++;
-            if (data.api_key !== 'none') activeKeys.add(data.api_key);
-            
-            document.getElementById('total-requests').textContent = totalRequests;
-            document.getElementById('successful-requests').textContent = successfulRequests;
-            document.getElementById('blocked-requests').textContent = blockedRequests;
-            document.getElementById('active-keys').textContent = activeKeys.size;
-            
-            const now = new Date().toLocaleTimeString();
-            requestChart.data.labels.push(now);
-            requestChart.data.datasets[0].data.push(totalRequests);
-            if (requestChart.data.labels.length > 20) {
-                requestChart.data.labels.shift();
-                requestChart.data.datasets[0].data.shift();
-            }
-            requestChart.update();
-            
-            statusChart.data.datasets[0].data = [successfulRequests, blockedRequests];
-            statusChart.update();
-            
-            const logsDiv = document.getElementById('logs');
-            const entry = document.createElement('div');
-            entry.className = 'log-entry';
-            entry.innerHTML = `
-                <span class="status-${data.status}">[${data.status}]</span> 
-                ${new Date(data.timestamp).toLocaleTimeString()} - 
-                ${data.endpoint} - ${data.api_key}
-            `;
-            logsDiv.insertBefore(entry, logsDiv.firstChild);
-            if (logsDiv.children.length > 50) logsDiv.removeChild(logsDiv.lastChild);
-        });
-        
-        fetch('/api/metrics').then(r => r.json()).then(data => {
-            totalRequests = data.total_requests;
-            successfulRequests = data.successful_requests;
-            blockedRequests = data.blocked_requests;
-            document.getElementById('total-requests').textContent = totalRequests;
-            document.getElementById('successful-requests').textContent = successfulRequests;
-            document.getElementById('blocked-requests').textContent = blockedRequests;
-        });
-    </script>
 </body>
 </html>
 '''
