@@ -39,7 +39,10 @@ Usage:
 Last Updated: 2026
 """
 
-import jwt
+import sys
+import base64
+import json
+import hmac
 import time
 import secrets
 import hashlib
@@ -49,6 +52,122 @@ from typing import Dict, Optional, Set
 from threading import Lock
 
 from flask import Flask, request, jsonify, current_app
+
+
+def _is_free_threaded_python() -> bool:
+    abiflags = getattr(sys, "abiflags", "")
+    if "t" in abiflags:
+        return True
+    if hasattr(sys, "_is_gil_enabled"):
+        try:
+            return not sys._is_gil_enabled()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    exe = (sys.executable or "").lower()
+    return exe.endswith("t.exe")
+
+
+class JWTError(Exception):
+    pass
+
+
+class ExpiredSignatureError(JWTError):
+    pass
+
+
+class InvalidTokenError(JWTError):
+    pass
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def _jwt_json_default(value):
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _jwt_encode_hs256(payload: dict, secret_key: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":"), default=_jwt_json_default).encode("utf-8")
+    )
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    return f"{header_b64}.{payload_b64}.{_b64url_encode(sig)}"
+
+
+def _jwt_decode_hs256(token: str, secret_key: str) -> dict:
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError as e:
+        raise InvalidTokenError("Invalid JWT format") from e
+
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception as e:
+        raise InvalidTokenError("Invalid JWT encoding") from e
+
+    if header.get("alg") != "HS256":
+        raise InvalidTokenError("Unsupported JWT algorithm")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    try:
+        given = _b64url_decode(sig_b64)
+    except Exception as e:
+        raise InvalidTokenError("Invalid JWT signature encoding") from e
+
+    if not hmac.compare_digest(expected, given):
+        raise InvalidTokenError("Invalid JWT signature")
+
+    exp = payload.get("exp")
+    if exp is not None and int(time.time()) > int(exp):
+        raise ExpiredSignatureError("Token expired")
+
+    return payload
+
+
+_PYJWT = None
+if not _is_free_threaded_python():
+    try:
+        import jwt as _PYJWT  # type: ignore
+    except Exception:
+        _PYJWT = None
+
+
+def jwt_encode(payload: dict, secret_key: str, algorithm: str = "HS256") -> str:
+    if algorithm != "HS256":
+        raise InvalidTokenError("Only HS256 is supported")
+    if _PYJWT is not None:
+        return _PYJWT.encode(payload, secret_key, algorithm=algorithm)
+    return _jwt_encode_hs256(payload, secret_key)
+
+
+def jwt_decode(token: str, secret_key: str, algorithms=None) -> dict:
+    algorithms = algorithms or ["HS256"]
+    if "HS256" not in algorithms:
+        raise InvalidTokenError("Only HS256 is supported")
+
+    if _PYJWT is not None:
+        try:
+            return _PYJWT.decode(token, secret_key, algorithms=["HS256"])
+        except Exception as e:
+            name = type(e).__name__
+            if name == "ExpiredSignatureError":
+                raise ExpiredSignatureError(str(e)) from e
+            raise InvalidTokenError(str(e)) from e
+
+    return _jwt_decode_hs256(token, secret_key)
 
 
 
@@ -73,6 +192,7 @@ class JWTAuthManager:
             raise ValueError("Secret key must be at least 32 characters for security")
         
         # Token expiration times in seconds
+        self.access_token_expiry = 3600      # 1 hour
         self.refresh_token_expiry = 604800   # 7 days (not 600 seconds!)
         
         # Token blacklist for revocation (in production, use Redis)
@@ -100,14 +220,14 @@ class JWTAuthManager:
         if tier not in valid_tiers:
             raise ValueError(f"tier must be one of {valid_tiers}")
         
-        # Use UTC for consistent timezone handling
-        now = datetime.utcnow()
+        now_ts = int(time.time())
         
         # Access token payload
         access_payload = {
             'user_id': user_id,
             'tier': tier,
-            'iat': now,  # Issued at
+            'iat': now_ts,  # Issued at
+            'exp': now_ts + self.access_token_expiry,
             'type': 'access',
             'metadata': metadata or {},
             'jti': secrets.token_hex(16),  # Unique token ID for revocation
@@ -116,24 +236,16 @@ class JWTAuthManager:
         # Refresh token payload (minimal data for security)
         refresh_payload = {
             'user_id': user_id,
-            'iat': now,
-            'exp': now + timedelta(seconds=self.refresh_token_expiry),
+            'iat': now_ts,
+            'exp': now_ts + self.refresh_token_expiry,
             'type': 'refresh',
             'jti': secrets.token_hex(16),
         }
         
         # Generate tokens
-        access_token = jwt.encode(
-            access_payload,
-            self.secret_key,
-            algorithm=self.algorithm
-        )
+        access_token = jwt_encode(access_payload, self.secret_key, algorithm=self.algorithm)
         
-        refresh_token = jwt.encode(
-            refresh_payload,
-            self.secret_key,
-            algorithm=self.algorithm
-        )
+        refresh_token = jwt_encode(refresh_payload, self.secret_key, algorithm=self.algorithm)
         
         return {
             'access_token': access_token,
@@ -148,19 +260,15 @@ class JWTAuthManager:
     def verify_token(self, token: str, token_type: str = 'access') -> Dict:
 
         if not token or not isinstance(token, str):
-            raise jwt.InvalidTokenError("Token must be a non-empty string")
+            raise InvalidTokenError("Token must be a non-empty string")
         
         try:
             # Decode and verify token
-            payload = jwt.decode(
-                token,
-                self.secret_key,
-                algorithms=[self.algorithm]
-            )
+            payload = jwt_decode(token, self.secret_key, algorithms=[self.algorithm])
             
             # Verify token type matches expected
             if payload.get('type') != token_type:
-                raise jwt.InvalidTokenError(
+                raise InvalidTokenError(
                     f"Invalid token type. Expected '{token_type}', got '{payload.get('type')}'"
                 )
             
@@ -170,11 +278,11 @@ class JWTAuthManager:
                 raise ValueError(f"Token has been revoked")
             
             return payload
-            
-        except jwt.ExpiredSignatureError as e:
-            raise jwt.ExpiredSignatureError(f"Token expired: {str(e)}")
-        except jwt.InvalidTokenError as e:
-            raise jwt.InvalidTokenError(f"Invalid token: {str(e)}")
+
+        except ExpiredSignatureError as e:
+            raise ExpiredSignatureError(f"Token expired: {str(e)}")
+        except InvalidTokenError as e:
+            raise InvalidTokenError(f"Invalid token: {str(e)}")
     
     def refresh_access_token(self, refresh_token: str) -> Dict:
 
@@ -183,7 +291,7 @@ class JWTAuthManager:
         user_id = payload.get('user_id')
         
         if not user_id:
-            raise jwt.InvalidTokenError("Refresh token missing user_id")
+            raise InvalidTokenError("Refresh token missing user_id")
         
         # Generate new token pair (preserve tier from original if stored in DB)
         # In production, fetch user tier from database
@@ -202,7 +310,7 @@ class JWTAuthManager:
             else:
                 print(f"⚠️  Token has no JTI, cannot revoke reliably")
                 
-        except (jwt.InvalidTokenError, jwt.ExpiredSignatureError) as e:
+        except (InvalidTokenError, ExpiredSignatureError) as e:
             print(f"⚠️  Cannot revoke invalid/expired token: {str(e)}")
     
     def _is_token_blacklisted(self, jti: str) -> bool:
@@ -283,13 +391,13 @@ class JWTAuthManager:
                     
                     return func(*args, **kwargs)
                     
-                except jwt.ExpiredSignatureError:
+                except ExpiredSignatureError:
                     return jsonify({
                         'error': 'Token expired',
                         'message': 'Your token has expired. Please refresh or login again.'
                     }), 401
                     
-                except jwt.InvalidTokenError as e:
+                except InvalidTokenError as e:
                     return jsonify({
                         'error': 'Invalid token',
                         'message': str(e)
@@ -396,7 +504,7 @@ class JWTAuthManager:
             try:
                 tokens = jwt_manager.refresh_access_token(refresh_token)
                 return jsonify(tokens)
-            except (jwt.InvalidTokenError, jwt.ExpiredSignatureError, ValueError) as e:
+            except (InvalidTokenError, ExpiredSignatureError, ValueError) as e:
                 return jsonify({'error': str(e)}), 401
         
         @app.route('/auth/logout', methods=['POST'])

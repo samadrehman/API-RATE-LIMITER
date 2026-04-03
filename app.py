@@ -11,6 +11,10 @@ import sqlite3
 import time
 from flask import g, send_file  
 import secrets
+import sys
+import base64
+import json
+import hmac
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from threading import Lock
@@ -19,14 +23,197 @@ from functools import wraps
 import hashlib
 
 from flask import Flask, request, jsonify, render_template_string, abort
-from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 
 import os
 from dotenv import load_dotenv
-import jwt as pyjwt
 
 load_dotenv()
+
+
+def _is_free_threaded_python() -> bool:
+    """Detect CPython free-threaded builds (PEP 703) where some deps may crash."""
+    abiflags = getattr(sys, "abiflags", "")
+    if "t" in abiflags:
+        return True
+    if hasattr(sys, "_is_gil_enabled"):
+        try:
+            return not sys._is_gil_enabled()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    exe = (sys.executable or "").lower()
+    return exe.endswith("t.exe")
+
+
+class JWTError(Exception):
+    pass
+
+
+class ExpiredSignatureError(JWTError):
+    pass
+
+
+class InvalidTokenError(JWTError):
+    pass
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def _jwt_json_default(value: Any):
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _jwt_encode_hs256(payload: dict, secret_key: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":"), default=_jwt_json_default).encode("utf-8")
+    )
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def _jwt_decode_hs256(token: str, secret_key: str) -> dict:
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError as e:
+        raise InvalidTokenError("Invalid JWT format") from e
+
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception as e:
+        raise InvalidTokenError("Invalid JWT encoding") from e
+
+    if header.get("alg") != "HS256":
+        raise InvalidTokenError("Unsupported JWT algorithm")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    try:
+        given = _b64url_decode(sig_b64)
+    except Exception as e:
+        raise InvalidTokenError("Invalid JWT signature encoding") from e
+
+    if not hmac.compare_digest(expected, given):
+        raise InvalidTokenError("Invalid JWT signature")
+
+    exp = payload.get("exp")
+    if exp is not None:
+        try:
+            exp_int = int(exp)
+        except Exception as e:
+            raise InvalidTokenError("Invalid exp claim") from e
+        if int(datetime.utcnow().timestamp()) > exp_int:
+            raise ExpiredSignatureError("Token expired")
+
+    return payload
+
+
+_PYJWT = None
+if not _is_free_threaded_python():
+    try:
+        import jwt as _PYJWT  # type: ignore
+    except Exception:
+        _PYJWT = None
+
+
+def jwt_encode(payload: dict, secret_key: str, algorithm: str = "HS256") -> str:
+    if algorithm != "HS256":
+        raise InvalidTokenError("Only HS256 is supported")
+    if _PYJWT is not None:
+        return _PYJWT.encode(payload, secret_key, algorithm=algorithm)
+    return _jwt_encode_hs256(payload, secret_key)
+
+
+def jwt_decode(token: str, secret_key: str, algorithms: Optional[List[str]] = None) -> dict:
+    algorithms = algorithms or ["HS256"]
+    if "HS256" not in algorithms:
+        raise InvalidTokenError("Only HS256 is supported")
+
+    if _PYJWT is not None:
+        try:
+            return _PYJWT.decode(token, secret_key, algorithms=["HS256"])
+        except Exception as e:
+            # Normalize PyJWT errors to our local exception types.
+            name = type(e).__name__
+            if name == "ExpiredSignatureError":
+                raise ExpiredSignatureError(str(e)) from e
+            raise InvalidTokenError(str(e)) from e
+
+    return _jwt_decode_hs256(token, secret_key)
+
+
+class _SocketIONoop:
+    """Fallback SocketIO implementation (no WebSocket features)."""
+
+    def __init__(self, flask_app: Flask):
+        self._app = flask_app
+
+    def on(self, event: str):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    def emit(self, *args, **kwargs):
+        return None
+
+    def run(self, flask_app: Flask, **kwargs):
+        # Flask's built-in server; only supports basic HTTP.
+        return flask_app.run(
+            host=kwargs.get("host"),
+            port=kwargs.get("port"),
+            debug=kwargs.get("debug"),
+        )
+
+
+def _init_socketio(flask_app: Flask):
+    """Initialize SocketIO safely.
+
+    On Python free-threaded builds, importing flask-socketio may crash due to
+    optional compiled speedups in its dependency chain.
+    """
+    enable_socketio = os.getenv("ENABLE_SOCKETIO", "1").strip().lower() not in {"0", "false", "no"}
+    if not enable_socketio or _is_free_threaded_python():
+        return _SocketIONoop(flask_app), False
+
+    try:
+        from flask_socketio import SocketIO as _SocketIO  # type: ignore
+
+        return (
+            _SocketIO(
+                flask_app,
+                cors_allowed_origins=Config.CORS_ORIGINS,
+                async_mode=Config.SOCKETIO_ASYNC_MODE,
+                max_http_buffer_size=Config.MAX_CONTENT_LENGTH,
+            ),
+            True,
+        )
+    except Exception:
+        return _SocketIONoop(flask_app), False
+
+
+def emit(event: str, data: Any = None, **kwargs):
+    """Compatibility wrapper for flask_socketio.emit.
+
+    When SocketIO is disabled/unavailable, this is a no-op.
+    """
+    try:
+        socketio.emit(event, data or {}, **kwargs)  # type: ignore[name-defined]
+    except Exception:
+        return None
 
 # CONFIGURATION
 
@@ -40,6 +227,7 @@ class Config:
     # Database
     DATABASE_URL = os.getenv('DATABASE_URL')  
     DB_PATH = os.getenv('DB_PATH', 'ratelimiter.db')  
+    DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
     
     # Rate Limiting
     RATE_LIMITS = {
@@ -86,7 +274,7 @@ class JWTAuthManager:
             "iat": datetime.utcnow(),
             "metadata": metadata or {}
         }
-        return pyjwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+        return jwt_encode(payload, self.secret_key, algorithm=self.algorithm)
     
     def generate_refresh_token(self, user_id: str) -> str:
         """Generate refresh token"""
@@ -96,18 +284,18 @@ class JWTAuthManager:
             "exp": datetime.utcnow() + self.refresh_token_expiry,
             "iat": datetime.utcnow()
         }
-        return pyjwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+        return jwt_encode(payload, self.secret_key, algorithm=self.algorithm)
     
     def verify_token(self, token: str, token_type: str = "access") -> Optional[dict]:
         """Verify and decode token"""
         try:
-            payload = pyjwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            payload = jwt_decode(token, self.secret_key, algorithms=[self.algorithm])
             if payload.get("type") != token_type:
                 return None
             return payload
-        except pyjwt.ExpiredSignatureError:
+        except ExpiredSignatureError:
             return None
-        except pyjwt.InvalidTokenError:
+        except InvalidTokenError:
             return None
     
     def init_auth_endpoints(self, app):
@@ -239,12 +427,7 @@ app.config['SECRET_KEY'] = Config.SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
 
 CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=True)
-socketio = SocketIO(
-    app,
-    cors_allowed_origins=Config.CORS_ORIGINS,
-    async_mode=Config.SOCKETIO_ASYNC_MODE,
-    max_http_buffer_size=Config.MAX_CONTENT_LENGTH
-)
+socketio, _socketio_available = _init_socketio(app)
 
 jwt_manager = JWTAuthManager(secret_key=Config.SECRET_KEY, algorithm="HS256")
 app.config["JWT_MANAGER"] = jwt_manager
@@ -301,22 +484,41 @@ def ensure_db_schema() -> None:
     cursor = conn.cursor()
     
     try:
+        def get_columns(table_name: str) -> set:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            return {row["name"] for row in cursor.fetchall()}
+
+        def add_column_if_missing(table_name: str, column_def: str) -> None:
+            column_name = column_def.strip().split()[0]
+            if column_name not in get_columns(table_name):
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+
         # Auth users table
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS auth_users (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 tier TEXT DEFAULT 'free',
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        # Lightweight migrations for existing DBs (cannot add UNIQUE/NOT NULL constraints here)
+        add_column_if_missing("auth_users", "user_id TEXT")
+        add_column_if_missing("auth_users", "email TEXT")
+        add_column_if_missing("auth_users", "password_hash TEXT")
+        add_column_if_missing("auth_users", "tier TEXT DEFAULT 'free'")
+        add_column_if_missing("auth_users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Users table (API keys)
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key_hash TEXT UNIQUE NOT NULL,
                 api_key_prefix TEXT NOT NULL,
                 user_id TEXT,
@@ -327,14 +529,28 @@ def ensure_db_schema() -> None:
                 tier TEXT DEFAULT 'free',
                 total_requests INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT NOW()
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        add_column_if_missing("users", "api_key_hash TEXT")
+        add_column_if_missing("users", "api_key_prefix TEXT")
+        add_column_if_missing("users", "user_id TEXT")
+        add_column_if_missing("users", "request_count INTEGER DEFAULT 0")
+        add_column_if_missing("users", "window_start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        add_column_if_missing("users", "blocked INTEGER DEFAULT 0")
+        add_column_if_missing("users", "banned_until TEXT DEFAULT NULL")
+        add_column_if_missing("users", "tier TEXT DEFAULT 'free'")
+        add_column_if_missing("users", "total_requests INTEGER DEFAULT 0")
+        add_column_if_missing("users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        add_column_if_missing("users", "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Logs table
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS logs (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key_prefix TEXT,
                 endpoint TEXT NOT NULL,
                 method TEXT DEFAULT 'GET',
@@ -342,39 +558,76 @@ def ensure_db_schema() -> None:
                 ip_hash TEXT,
                 user_agent TEXT,
                 response_time_ms INTEGER,
-                timestamp TIMESTAMP DEFAULT NOW()
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        add_column_if_missing("logs", "api_key_prefix TEXT")
+        add_column_if_missing("logs", "endpoint TEXT")
+        add_column_if_missing("logs", "method TEXT DEFAULT 'GET'")
+        add_column_if_missing("logs", "status_code INTEGER")
+        add_column_if_missing("logs", "ip_hash TEXT")
+        add_column_if_missing("logs", "user_agent TEXT")
+        add_column_if_missing("logs", "response_time_ms INTEGER")
+        add_column_if_missing("logs", "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Analytics table
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS analytics (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 metric_type TEXT NOT NULL,
                 metric_value REAL,
                 metadata TEXT,
-                timestamp TIMESTAMP DEFAULT NOW()
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        add_column_if_missing("analytics", "metric_type TEXT")
+        add_column_if_missing("analytics", "metric_value REAL")
+        add_column_if_missing("analytics", "metadata TEXT")
+        add_column_if_missing("analytics", "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Admin audit table
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS admin_audit (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 action TEXT NOT NULL,
                 target_api_key_prefix TEXT,
                 admin_ip_hash TEXT,
                 details TEXT,
-                timestamp TIMESTAMP DEFAULT NOW()
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        add_column_if_missing("admin_audit", "action TEXT")
+        add_column_if_missing("admin_audit", "target_api_key_prefix TEXT")
+        add_column_if_missing("admin_audit", "admin_ip_hash TEXT")
+        add_column_if_missing("admin_audit", "details TEXT")
+        add_column_if_missing("admin_audit", "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Create indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_api_key_prefix ON logs(api_key_prefix)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_api_key_hash ON users(api_key_hash)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_timestamp ON admin_audit(timestamp)")
+        logs_cols = get_columns("logs")
+        if "timestamp" in logs_cols:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
+        if "api_key_prefix" in logs_cols:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_api_key_prefix ON logs(api_key_prefix)")
+
+        analytics_cols = get_columns("analytics")
+        if "timestamp" in analytics_cols:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics(timestamp)")
+
+        users_cols = get_columns("users")
+        if "api_key_hash" in users_cols:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_api_key_hash ON users(api_key_hash)")
+
+        admin_cols = get_columns("admin_audit")
+        if "timestamp" in admin_cols:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_timestamp ON admin_audit(timestamp)")
         
         conn.commit()
         
@@ -860,506 +1113,320 @@ DASHBOARD_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>API Rate Limiter</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {
+            --bg: #f3f6fb;
+            --card: #ffffff;
+            --text: #152132;
+            --muted: #5f6d7d;
+            --border: #d9e3f0;
+            --accent: #2563eb;
+            --accent-soft: #eff6ff;
+            --ok: #15803d;
+            --warn: #b45309;
+            --danger: #b91c1c;
         }
 
+        * { box-sizing: border-box; }
+
         body {
-            font-family: 'Monaco', 'Courier New', monospace;
-            background: #0d1117;
-            color: #c9d1d9;
-            padding: 40px 20px;
-            line-height: 1.8;
-            font-size: 14px;
+            margin: 0;
+            background: linear-gradient(180deg, #f9fbff 0%, var(--bg) 100%);
+            color: var(--text);
+            font-family: Arial, Helvetica, sans-serif;
+            line-height: 1.5;
         }
 
         .container {
-            max-width: 900px;
+            max-width: 1280px;
             margin: 0 auto;
+            padding: 28px 18px 56px;
+        }
+
+        .hero {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: 0 12px 30px rgba(21, 33, 50, 0.06);
+        }
+
+        .hero h1 {
+            margin: 0 0 10px;
+            font-size: clamp(28px, 4vw, 42px);
+            line-height: 1.1;
+        }
+
+        .hero p {
+            margin: 0;
+            color: var(--muted);
+            max-width: 820px;
+        }
+
+        .chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .chip {
+            border-radius: 999px;
+            padding: 7px 10px;
+            font-size: 13px;
+            font-weight: 700;
+            background: var(--accent-soft);
+            color: var(--accent);
+            border: 1px solid #dbeafe;
+        }
+
+        .grid {
+            display: grid;
+            gap: 16px;
+            margin-top: 16px;
+            grid-template-columns: 1.3fr 1fr;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 18px;
+            box-shadow: 0 8px 22px rgba(21, 33, 50, 0.05);
+        }
+
+        .card h2 {
+            margin: 0 0 8px;
+            font-size: 20px;
+        }
+
+        .card h3 {
+            margin: 18px 0 8px;
+            font-size: 16px;
+        }
+
+        p { margin: 0 0 10px; }
+
+        .note {
+            border-radius: 12px;
+            padding: 12px 14px;
+            border: 1px solid #fde68a;
+            background: #fffbeb;
+            color: #854d0e;
+            font-size: 14px;
+        }
+
+        .danger {
+            border-color: #fecaca;
+            background: #fef2f2;
+            color: var(--danger);
         }
 
         pre {
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 6px;
-            padding: 16px;
+            margin: 10px 0 14px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: #f8fbff;
+            padding: 12px;
             overflow-x: auto;
-            margin: 16px 0;
+            font-size: 13px;
+            line-height: 1.45;
         }
 
         code {
-            color: #79c0ff;
-        }
-
-        h1, h2, h3 {
-            color: #58a6ff;
-            margin-top: 32px;
-            margin-bottom: 16px;
-        }
-
-        h1 {
-            font-size: 2em;
-            border-bottom: 1px solid #21262d;
-            padding-bottom: 8px;
-        }
-
-        h2 {
-            font-size: 1.5em;
-            border-bottom: 1px solid #21262d;
-            padding-bottom: 8px;
-        }
-
-        h3 {
-            font-size: 1.2em;
-        }
-
-        a {
-            color: #58a6ff;
-            text-decoration: none;
-        }
-
-        a:hover {
-            text-decoration: underline;
-        }
-
-        .warning {
-            background: #1e1e1e;
-            border-left: 4px solid #f85149;
-            padding: 12px 16px;
-            margin: 16px 0;
-        }
-
-        .info {
-            background: #1e1e1e;
-            border-left: 4px solid #58a6ff;
-            padding: 12px 16px;
-            margin: 16px 0;
+            background: #eef4ff;
+            border-radius: 6px;
+            padding: 2px 6px;
+            color: #1d4ed8;
+            font-size: 0.94em;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            margin: 16px 0;
+            margin-top: 8px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
         }
 
         th, td {
             text-align: left;
-            padding: 8px 12px;
-            border: 1px solid #30363d;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
         }
 
         th {
-            background: #161b22;
-            color: #58a6ff;
+            background: #f8fbff;
+            color: #1e293b;
+            font-size: 13px;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
         }
 
-        .meta {
-            color: #8b949e;
-            margin-bottom: 32px;
-        }
-
-        hr {
-            border: none;
-            border-top: 1px solid #21262d;
-            margin: 32px 0;
-        }
+        tr:last-child td { border-bottom: none; }
 
         .badge {
             display: inline-block;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 12px;
-            font-weight: bold;
-            margin-left: 8px;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 11px;
+            font-weight: 700;
+            border: 1px solid transparent;
         }
 
-        .badge-get { background: #238636; color: white; }
-        .badge-post { background: #1f6feb; color: white; }
-        .badge-auth { background: #da3633; color: white; }
+        .badge-get {
+            color: var(--ok);
+            border-color: #bbf7d0;
+            background: #f0fdf4;
+        }
+
+        .badge-post {
+            color: #1e40af;
+            border-color: #bfdbfe;
+            background: #eff6ff;
+        }
+
+        .badge-auth {
+            color: #7c2d12;
+            border-color: #fed7aa;
+            background: #fff7ed;
+        }
+
+        .quick-links {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .link-card {
+            text-decoration: none;
+            color: inherit;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
+            background: #fbfdff;
+        }
+
+        .link-card:hover {
+            border-color: #bfdbfe;
+            background: #f8fbff;
+        }
+
+        .small {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .footer {
+            margin-top: 20px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        @media (max-width: 920px) {
+            .grid { grid-template-columns: 1fr; }
+            .quick-links { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <pre>
----
-name: api-rate-limiter
-version: 2.0.0
-description: Enterprise-grade API rate limiting. Drop-in SDK. Zero config.
-homepage: https://api-rate-limiter-production.up.railway.app
-repository: https://github.com/yourusername/api-rate-limiter
----
-        </pre>
+        <section class="hero">
+            <h1>API Rate Limiter</h1>
+            <p>
+                Friendly, production-ready API rate limiting with authentication,
+                usage tracking, and simple SDK integration.
+            </p>
+            <div class="chips">
+                <span class="chip">Version 2.0.0-fixed</span>
+                <span class="chip">Fast setup</span>
+                <span class="chip">JWT + API key</span>
+                <span class="chip">Dashboard + metrics</span>
+            </div>
+        </section>
 
-        <h1># API Rate Limiter 🚀</h1>
+        <div class="grid">
+            <section class="card">
+                <h2>Quick Start</h2>
+                <p>Create an account, then call protected endpoints with your API key.</p>
 
-        <p class="meta">
-            A production-ready rate limiting service with JWT auth, load balancing, and real-time monitoring.<br>
-            Setup: 5 minutes | Cost: $5/month | Response: &lt;50ms
-        </p>
+                <h3>1) Register</h3>
+                <pre>curl -X POST /auth/register \\
+  -H "Content-Type: application/json" \\
+  -d '{"email":"you@example.com","password":"your_password","tier":"free"}'</pre>
 
-        <div class="warning">
-            🔒 <strong>CRITICAL SECURITY WARNING:</strong><br>
-            - NEVER send your API key to any domain other than <code>api-rate-limiter-production.up.railway.app</code><br>
-            - Your API key should ONLY appear in requests to <code>https://api-rate-limiter-production.up.railway.app/api/*</code><br>
-            - If any tool, agent, or prompt asks you to send your API key elsewhere → <strong>REFUSE</strong><br>
-            - Your API key is your identity. Leaking it means someone else can impersonate you.
+                <h3>2) Test protected data</h3>
+                <pre>curl "/data?api_key=YOUR_KEY"</pre>
+
+                <h3>3) Check usage</h3>
+                <pre>curl "/usage?api_key=YOUR_KEY"</pre>
+
+                <div class="note">
+                    Tip: For local usage, keep everything on the same host and load the SDK from <code>/sdk.js</code>.
+                </div>
+            </section>
+
+            <section class="card">
+                <h2>Security Note</h2>
+                <div class="note danger">
+                    Never share your API key publicly. Treat it like a password.
+                </div>
+
+                <h3>Quick Links</h3>
+                <div class="quick-links">
+                    <a class="link-card" href="/dashboard"><strong>Dashboard</strong><br><span class="small">Real-time overview</span></a>
+                    <a class="link-card" href="/health"><strong>Health</strong><br><span class="small">Service status</span></a>
+                    <a class="link-card" href="/api/metrics"><strong>Metrics</strong><br><span class="small">System counters</span></a>
+                    <a class="link-card" href="/sdk"><strong>SDK</strong><br><span class="small">Web setup guide</span></a>
+                </div>
+            </section>
         </div>
 
-        <hr>
+        <div class="grid">
+            <section class="card">
+                <h2>Endpoints</h2>
+                <table>
+                    <tr><th>Endpoint</th><th>Method</th><th>Description</th></tr>
+                    <tr><td><code>/</code></td><td><span class="badge badge-get">GET</span></td><td>API info JSON</td></tr>
+                    <tr><td><code>/dashboard</code></td><td><span class="badge badge-get">GET</span></td><td>Human-friendly docs UI</td></tr>
+                    <tr><td><code>/data?api_key=KEY</code></td><td><span class="badge badge-get">GET</span></td><td>Protected sample endpoint</td></tr>
+                    <tr><td><code>/usage?api_key=KEY</code></td><td><span class="badge badge-get">GET</span></td><td>Current usage limits</td></tr>
+                    <tr><td><code>/api/metrics</code></td><td><span class="badge badge-get">GET</span></td><td>Realtime counters</td></tr>
+                    <tr><td><code>/sdk</code></td><td><span class="badge badge-get">GET</span></td><td>SDK setup web page</td></tr>
+                    <tr><td><code>/sdk.js</code></td><td><span class="badge badge-get">GET</span></td><td>SDK JavaScript file</td></tr>
+                    <tr><td><code>/sdk/check</code></td><td><span class="badge badge-post">POST</span></td><td>SDK rate-limit check</td></tr>
+                    <tr><td><code>/sdk/track</code></td><td><span class="badge badge-post">POST</span></td><td>SDK request tracking</td></tr>
+                </table>
+            </section>
 
-        <h2>## Quick Start</h2>
+            <section class="card">
+                <h2>Auth & Admin</h2>
+                <table>
+                    <tr><th>Endpoint</th><th>Method</th><th>Auth</th></tr>
+                    <tr><td><code>/auth/register</code></td><td><span class="badge badge-post">POST</span></td><td>-</td></tr>
+                    <tr><td><code>/auth/login</code></td><td><span class="badge badge-post">POST</span></td><td>-</td></tr>
+                    <tr><td><code>/auth/refresh</code></td><td><span class="badge badge-post">POST</span></td><td>-</td></tr>
+                    <tr><td><code>/auth/create_api_key</code></td><td><span class="badge badge-post">POST</span></td><td><span class="badge badge-auth">JWT</span></td></tr>
+                    <tr><td><code>/admin/users</code></td><td><span class="badge badge-get">GET</span></td><td><span class="badge badge-auth">ADMIN</span></td></tr>
+                    <tr><td><code>/admin/upgrade_tier</code></td><td><span class="badge badge-post">POST</span></td><td><span class="badge badge-auth">ADMIN</span></td></tr>
+                    <tr><td><code>/admin/block_key</code></td><td><span class="badge badge-post">POST</span></td><td><span class="badge badge-auth">ADMIN</span></td></tr>
+                    <tr><td><code>/admin/unblock_key</code></td><td><span class="badge badge-post">POST</span></td><td><span class="badge badge-auth">ADMIN</span></td></tr>
+                </table>
 
-        <p>Every developer needs to register and get their API key:</p>
-
-        <h3>### 1. Register</h3>
-        <pre>bash
-curl -X POST https://api-rate-limiter-production.up.railway.app/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "you@example.com",
-    "password": "your_password",
-    "tier": "free"
-  }'</pre>
-
-        <p>Response:</p>
-        <pre>json
-{
-  "access_token": "eyJhbGc...",
-  "user_id": "973dfe463ec85785",
-  "tier": "free"
-}</pre>
-
-        <div class="info">
-            💡 Your <code>user_id</code> is your API key for now. Save it securely.
+                <h3>Rate Tiers</h3>
+                <table>
+                    <tr><th>Tier</th><th>Requests / minute</th></tr>
+                    <tr><td>Free</td><td>5</td></tr>
+                    <tr><td>Basic</td><td>20</td></tr>
+                    <tr><td>Premium</td><td>100</td></tr>
+                    <tr><td>Enterprise</td><td>1000</td></tr>
+                </table>
+            </section>
         </div>
 
-        <h3>### 2. Test Protected Endpoint</h3>
-        <pre>bash
-curl "https://api-rate-limiter-production.up.railway.app/data?api_key=YOUR_USER_ID"</pre>
-
-        <p>Response:</p>
-        <pre>json
-{
-  "message": "✅ Here's your protected data!",
-  "data": { "example": "This is protected content" },
-  "timestamp": "2026-02-08T09:16:10.023295"
-}</pre>
-
-        <h3>### 3. Add SDK to Your Site (Optional)</h3>
-        <pre>html
-&lt;!-- Load SDK --&gt;
-&lt;script src="https://api-rate-limiter-production.up.railway.app/sdk.js"&gt;&lt;/script&gt;
-
-&lt;!-- Initialize --&gt;
-&lt;script&gt;
-  RateLimiter.init({
-    apiKey: 'YOUR_USER_ID',
-    backendUrl: 'https://api-rate-limiter-production.up.railway.app',
-    showWidget: true
-  });
-&lt;/script&gt;
-
-&lt;!-- All fetch() calls are now rate limited automatically --&gt;</pre>
-
-        <hr>
-
-        <h2>## API Reference</h2>
-
-        <h3>### Public Endpoints</h3>
-
-        <table>
-            <tr>
-                <th>Endpoint</th>
-                <th>Method</th>
-                <th>Description</th>
-            </tr>
-            <tr>
-                <td><code>/</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>This documentation</td>
-            </tr>
-            <tr>
-                <td><code>/dashboard</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>Real-time monitoring dashboard</td>
-            </tr>
-            <tr>
-                <td><code>/sdk.js</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>Client SDK JavaScript file</td>
-            </tr>
-            <tr>
-                <td><code>/health</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>Service health check</td>
-            </tr>
-        </table>
-
-        <h3>### Authentication</h3>
-
-        <table>
-            <tr>
-                <th>Endpoint</th>
-                <th>Method</th>
-                <th>Description</th>
-            </tr>
-            <tr>
-                <td><code>/auth/register</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td>Create new account</td>
-            </tr>
-            <tr>
-                <td><code>/auth/login</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td>Get access tokens</td>
-            </tr>
-            <tr>
-                <td><code>/auth/refresh</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td>Refresh access token</td>
-            </tr>
-            <tr>
-                <td><code>/auth/create_api_key</code></td>
-                <td><span class="badge badge-post">POST</span> <span class="badge badge-auth">JWT</span></td>
-                <td>Generate API key</td>
-            </tr>
-        </table>
-
-        <h3>### Protected Endpoints</h3>
-
-        <table>
-            <tr>
-                <th>Endpoint</th>
-                <th>Method</th>
-                <th>Description</th>
-            </tr>
-            <tr>
-                <td><code>/data?api_key=KEY</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>Protected data (rate limited)</td>
-            </tr>
-            <tr>
-                <td><code>/usage?api_key=KEY</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>Check usage statistics</td>
-            </tr>
-            <tr>
-                <td><code>/api/metrics</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td>System metrics</td>
-            </tr>
-        </table>
-
-        <h3>### SDK Endpoints</h3>
-
-        <table>
-            <tr>
-                <th>Endpoint</th>
-                <th>Method</th>
-                <th>Description</th>
-            </tr>
-            <tr>
-                <td><code>/sdk/check</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td>Verify rate limit before request</td>
-            </tr>
-            <tr>
-                <td><code>/sdk/track</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td>Log request analytics</td>
-            </tr>
-        </table>
-
-        <h3>### Admin Endpoints</h3>
-
-        <table>
-            <tr>
-                <th>Endpoint</th>
-                <th>Method</th>
-                <th>Auth</th>
-                <th>Description</th>
-            </tr>
-            <tr>
-                <td><code>/admin/users</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td><span class="badge badge-auth">ADMIN</span></td>
-                <td>List all users</td>
-            </tr>
-            <tr>
-                <td><code>/admin/upgrade_tier</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td><span class="badge badge-auth">ADMIN</span></td>
-                <td>Upgrade user tier</td>
-            </tr>
-            <tr>
-                <td><code>/admin/block_key</code></td>
-                <td><span class="badge badge-post">POST</span></td>
-                <td><span class="badge badge-auth">ADMIN</span></td>
-                <td>Block API key</td>
-            </tr>
-            <tr>
-                <td><code>/logs</code></td>
-                <td><span class="badge badge-get">GET</span></td>
-                <td><span class="badge badge-auth">ADMIN</span></td>
-                <td>View request logs</td>
-            </tr>
-        </table>
-
-        <hr>
-
-        <h2>## Rate Limit Tiers</h2>
-
-        <table>
-            <tr>
-                <th>Tier</th>
-                <th>Requests/Min</th>
-                <th>Price</th>
-            </tr>
-            <tr>
-                <td><strong>Free</strong></td>
-                <td>5</td>
-                <td>$0</td>
-            </tr>
-            <tr>
-                <td><strong>Basic</strong></td>
-                <td>20</td>
-                <td>$29/month</td>
-            </tr>
-            <tr>
-                <td><strong>Premium</strong></td>
-                <td>100</td>
-                <td>$79/month</td>
-            </tr>
-            <tr>
-                <td><strong>Enterprise</strong></td>
-                <td>1,000</td>
-                <td>$199/month</td>
-            </tr>
-        </table>
-
-        <hr>
-
-        <h2>## SDK Usage</h2>
-
-        <p>The SDK automatically intercepts all <code>fetch()</code> and <code>XMLHttpRequest</code> calls:</p>
-
-        <pre>javascript
-// Rate Limiter SDK
-class RateLimiterSDK {
-  constructor(apiKey, baseURL = 'https://api-rate-limiter-production.up.railway.app') {
-    this.apiKey = apiKey;
-    this.baseURL = baseURL;
-  }
-
-  async check(endpoint, method = 'GET') {
-    const response = await fetch(`${this.baseURL}/sdk/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: this.apiKey, endpoint, method })
-    });
-    return response.json();
-  }
-
-  async track(endpoint, method, statusCode, responseTime) {
-    await fetch(`${this.baseURL}/sdk/track`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: this.apiKey,
-        endpoint,
-        method,
-        status_code: statusCode,
-        response_time_ms: responseTime
-      })
-    });
-  }
-}</pre>
-
-        <hr>
-
-        <h2>## Examples</h2>
-
-        <h3>### Check Usage</h3>
-        <pre>bash
-curl "https://api-rate-limiter-production.up.railway.app/usage?api_key=YOUR_KEY"</pre>
-
-        <p>Response:</p>
-        <pre>json
-{
-  "tier": "free",
-  "requests_left": 3,
-  "requests_limit": 5,
-  "window_seconds": 60,
-  "reset_in_seconds": 42,
-  "total_requests_lifetime": 127
-}</pre>
-
-        <h3>### SDK Check Before Request</h3>
-        <pre>bash
-curl -X POST https://api-rate-limiter-production-0c76.up.railway.app/sdk.js \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_KEY",
-    "endpoint": "/api/data",
-    "method": "GET"
-  }'</pre>
-
-        <p>Response:</p>
-        <pre>json
-{
-  "allowed": true,
-  "remaining": 4,
-  "limit": 5,
-  "tier": "free",
-  "reset_at": "2026-02-08T10:15:00.000Z"
-}</pre>
-
-        <hr>
-
-        <h2>## Features</h2>
-
-        <ul style="list-style: none; padding-left: 0;">
-            <li>✓ Smart rate limiting (token bucket + sliding window)</li>
-            <li>✓ JWT authentication with refresh tokens</li>
-            <li>✓ Real-time WebSocket dashboard</li>
-            <li>✓ Automatic abuse detection & ban</li>
-            <li>✓ Load balancing (6 strategies)</li>
-            <li>✓ Geographic routing</li>
-            <li>✓ Request analytics & logging</li>
-            <li>✓ Client SDK (one script tag)</li>
-            <li>✓ Admin panel for user management</li>
-            <li>✓ Production-ready (deployed on Railway)</li>
-        </ul>
-
-        <hr>
-
-        <h2>## Tech Stack</h2>
-
-        <pre>
-Backend:    Python 3.8+ | Flask 2.3.3 | Gunicorn 21.2.0
-Database:   SQLite (dev) | PostgreSQL (prod)
-Auth:       JWT (PyJWT 2.8.0) | bcrypt 4.1.2
-Real-time:  Flask-SocketIO 5.3.6 | WebSockets
-Deploy:     Railway ($5/month)
-        </pre>
-
-        <hr>
-
-        <h2>## Links</h2>
-
-        <p>
-            Dashboard: <a href="/dashboard">/dashboard</a><br>
-            GitHub: <a href="https://github.com/samadrehman/API-RATE-LIMITER">github.com/samadrehman/API-RATE-LIMITER</a><br>
-            Contact: <a href="mailto:samadrehman550@gmail.com">Samad</a>
-        </p>
-
-        <hr>
-
-        <p style="color: #8b949e; margin-top: 40px;">
-            Built with ❤️ by <a href="https://www.linkedin.com/in/samad-rehman-6359723a1/">Samad</a> | v2.0.0 | 2026
-        </p>
+        <p class="footer">Built with Flask. Keep API keys private and rotate them when needed.</p>
     </div>
 </body>
 </html>
@@ -1512,42 +1579,21 @@ def usage():
 
 # SDK ENDPOINTS
 
+@app.route('/sdk')
+def sdk_page():
+    """Serve SDK setup UI page"""
+    page_path = os.path.join(app.root_path, 'static', 'demo.html')
+    if os.path.exists(page_path):
+        return send_file(page_path)
+    return jsonify({"error": "SDK page not found"}), 404
+
 @app.route('/sdk.js')
 def serve_sdk():
     """Serve SDK"""
-    sdk_content = '''
-// Rate Limiter SDK
-class RateLimiterSDK {
-    constructor(apiKey, baseURL = 'http://localhost:5000') {
-        this.apiKey = apiKey;
-        this.baseURL = baseURL;
-    }
-    
-    async check(endpoint, method = 'GET') {
-        const response = await fetch(`${this.baseURL}/sdk/check`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ api_key: this.apiKey, endpoint, method })
-        });
-        return response.json();
-    }
-    
-    async track(endpoint, method, statusCode, responseTime) {
-        await fetch(`${this.baseURL}/sdk/track`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                api_key: this.apiKey,
-                endpoint,
-                method,
-                status_code: statusCode,
-                response_time_ms: responseTime
-            })
-        });
-    }
-}
-'''
-    return sdk_content, 200, {'Content-Type': 'application/javascript'}
+    sdk_path = os.path.join(app.root_path, 'static', 'ratelimiter-sdk.js')
+    if os.path.exists(sdk_path):
+        return send_file(sdk_path, mimetype='application/javascript')
+    return jsonify({"error": "SDK file not found"}), 404
 
 
 @app.route('/sdk/check', methods=['POST'])

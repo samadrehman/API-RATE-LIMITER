@@ -12,7 +12,7 @@
  *   });
  * </script>
  */
-
+{
 (function(window) {
     'use strict';
 
@@ -353,3 +353,5 @@
     window.RateLimiter = RateLimiter;
 
 })(window);
+
+};

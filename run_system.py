@@ -36,7 +36,8 @@ import sys
 import time
 import signal
 import subprocess
-import psutil
+import socket
+import importlib.util
 import requests
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -117,18 +118,32 @@ class SystemRunner:
             print(f"❌ Missing required files: {', '.join(missing_files)}")
             return False
         
-        # Check Python packages
-        try:
-            import flask
-            import flask_socketio
-            import flask_cors
-            import psycopg
-            import jwt
-            print("✅ All Python dependencies available")
-        except ImportError as e:
-            print(f"❌ Missing Python package: {e}")
+        def has_module(module_name: str) -> bool:
+            return importlib.util.find_spec(module_name) is not None
+
+        required_modules = [
+            "flask",
+            "flask_cors",
+            "requests",
+        ]
+        optional_modules = [
+            "flask_socketio",  # app.py can run without it on some runtimes
+            "psycopg",         # DB can fall back to SQLite
+            "jwt",             # app/auth include a stdlib fallback for HS256
+        ]
+
+        missing_required = [m for m in required_modules if not has_module(m)]
+        if missing_required:
+            print(f"❌ Missing required Python package(s): {', '.join(missing_required)}")
             print("   Run: pip install -r requirements.txt")
             return False
+
+        missing_optional = [m for m in optional_modules if not has_module(m)]
+        if missing_optional:
+            print(f"⚠️ Optional packages not available: {', '.join(missing_optional)}")
+            print("   Some features may be disabled (WebSockets/Postgres/JWT backend)")
+        else:
+            print("✅ Core Python dependencies available")
         
         # Check if ports are available
         for port in [self.config["main_app_port"], self.config["load_balancer_port"]] + self.config["backend_ports"]:
@@ -139,10 +154,13 @@ class SystemRunner:
     
     def _is_port_in_use(self, port: int) -> bool:
         """Check if a port is already in use"""
-        for conn in psutil.net_connections():
-            if conn.laddr.port == port and conn.status == 'LISTEN':
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+                return False
+            except OSError:
                 return True
-        return False
     
     def setup_environment(self):
         """Setup environment variables from .env file"""
