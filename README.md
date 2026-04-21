@@ -7,9 +7,28 @@ Production-style API rate limiter project with JWT auth, admin controls, SDK int
 - Protects API endpoints with tier-based limits.
 - Supports register/login/refresh authentication flow.
 - Supports API key creation and usage tracking.
+- Includes usage analytics endpoints and dashboard views.
 - Provides admin actions for user tier upgrades and key blocking.
 - Includes a browser SDK (`/sdk.js`) and demo/setup page (`/sdk`).
 - Includes a standalone load balancer and geo-routing modules for advanced routing experiments.
+
+## Usage Analytics Dashboard
+
+Usage analytics is available through existing dashboard and metrics endpoints.
+
+- Main dashboard: `/dashboard`
+- Usage per key: `/usage?api_key=YOUR_KEY`
+- Runtime metrics: `/api/metrics`
+- Admin logs and audit: `/logs`, `/admin/audit`
+
+What you can monitor:
+
+- Current tier and per-minute limits
+- Remaining requests in active window
+- Request volume trends and counters
+- Admin actions and operational logs
+
+If you need a dedicated BI-style analytics UI, use these endpoints as the source and build a separate frontend panel.
 
 ## Premium / Paid section
 
@@ -51,6 +70,14 @@ Client
 | `static/demo.html` | Browser demo page for connecting and testing SDK behavior against the backend. |
 | `static/ratelimiter-sdk.js` | Client-side SDK that checks limits before requests, tracks calls, and can show usage widgets/errors. |
 | `README.md` | Project documentation (this file). |
+| `API_DOCUMENTATION.md` | Dedicated API reference with endpoint-by-endpoint details and examples. |
+| `EMAIL_NOTIFICATIONS.md` | Email notification feature spec, event model, and integration guidance. |
+
+## Separate API documentation
+
+The complete API reference is available in `API_DOCUMENTATION.md`.
+
+- It contains endpoint groups, auth modes, expected payloads, error model, and quick examples.
 
 ## Quick start
 
@@ -165,6 +192,23 @@ python database.py verify
 
 - Docker: use `Dockerfile` (gunicorn serves `app:app` on port 8000).
 - Railway: see `railway.toml` for build/start settings.
+
+## Email notifications
+
+Email notifications are implemented and configurable.
+
+- Feature spec: `EMAIL_NOTIFICATIONS.md`
+- Current code status: SMTP notifier is live with async, fail-safe delivery
+- Implemented events include tier changes, abuse alerts, block/unblock actions, key bans, and rate-limit spikes
+
+Required env vars to enable:
+
+- `EMAIL_NOTIFICATIONS_ENABLED=true`
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`
+- `EMAIL_FROM`, `ALERT_EMAIL_TO`
+- Optional: `SMTP_USE_TLS`, `SMTP_USE_SSL`, `SMTP_TIMEOUT_SECONDS`, `EMAIL_EVENT_COOLDOWN_SECONDS`
+
+This lets you add notifications safely without changing existing API behavior first.
 
 ## Environment variables (common)
 

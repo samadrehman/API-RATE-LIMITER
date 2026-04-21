@@ -201,7 +201,6 @@ class JWTAuthManager:
         
         # Security logging
         print(f"✅ JWT Manager initialized")
-        print(f"🔑 Secret key: {self.secret_key[:8]}...***KEEP SECRET***")
         print(f"🔐 Algorithm: {self.algorithm}")
         print(f"⏱️  Refresh token expiry: {self.refresh_token_expiry}s")
     

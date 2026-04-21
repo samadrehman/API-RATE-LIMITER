@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
+from email_notifier import EmailNotifier
 
 class LogManager:
     """
@@ -56,6 +57,9 @@ class LogManager:
         
         # Thread safety
         self.lock = Lock()
+
+        # Optional email notifications
+        self.email_notifier = EmailNotifier.from_env()
         
         # Abuse detection tracking
         self.ip_request_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
@@ -82,6 +86,10 @@ class LogManager:
         print(f"   Max log files: {self.max_log_files}")
         print(f"   Current log: {self.current_log_file}")
         print(f"   Abuse log: {self.abuse_log_file}")
+        if self.email_notifier.is_configured():
+            print("   Email alerts: enabled")
+        else:
+            print("   Email alerts: disabled or not configured")
     
     def log_request(self, 
                    ip: str,
@@ -334,6 +342,18 @@ class LogManager:
         
         with self.lock:
             self._write_log(self.abuse_log_file, log_line)
+
+        self.email_notifier.send_notification(
+            "abuse_detected",
+            {
+                "ip": ip,
+                "abuse_type": abuse_type,
+                "reasons": reasons,
+                "extra_info": extra_info,
+                "violations_count": self.ip_violations[ip],
+            },
+            subject=f"[RateLimiter] Security alert: {abuse_type}",
+        )
         
         print(f"🚨 ABUSE DETECTED: {ip} - {abuse_type}")
     

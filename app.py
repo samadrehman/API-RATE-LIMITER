@@ -12,6 +12,7 @@ import time
 from flask import g, send_file  
 import secrets
 import sys
+import re
 import base64
 import json
 import hmac
@@ -24,11 +25,32 @@ import hashlib
 
 from flask import Flask, request, jsonify, render_template_string, abort
 from flask_cors import CORS
+from email_notifier import EmailNotifier
+import bcrypt
 
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def hash_password(password: str) -> str:
+    """Hash password with bcrypt for strong password storage."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify bcrypt hash, with legacy SHA256 fallback for old records."""
+    if not stored_hash:
+        return False
+    if stored_hash.startswith('$2a$') or stored_hash.startswith('$2b$') or stored_hash.startswith('$2y$'):
+        try:
+            return bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
+        except Exception:
+            return False
+
+    legacy = hashlib.sha256(password.encode()).hexdigest()
+    return secrets.compare_digest(legacy, stored_hash)
 
 
 def _is_free_threaded_python() -> bool:
@@ -221,8 +243,8 @@ class Config:
     """Application configuration with secure defaults"""
 
     # Security
-    SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'dev-secret-key-change-me')
-    ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'dev-admin-token-change-me')
+    SECRET_KEY = os.getenv('JWT_SECRET_KEY') or secrets.token_urlsafe(48)
+    ADMIN_TOKEN = os.getenv('ADMIN_TOKEN') or secrets.token_urlsafe(48)
     
     # Database
     DATABASE_URL = os.getenv('DATABASE_URL')  
@@ -236,13 +258,20 @@ class Config:
         'premium': {'requests': 100, 'window': 60},
         'enterprise': {'requests': 1000, 'window': 60}
     }
+
+    PLAN_PRICING = {
+        'free': {'amount_due': 0.0, 'days': 30, 'currency': 'USD'},
+        'basic': {'amount_due': 29.0, 'days': 30, 'currency': 'USD'},
+        'premium': {'amount_due': 99.0, 'days': 30, 'currency': 'USD'},
+        'enterprise': {'amount_due': 299.0, 'days': 30, 'currency': 'USD'}
+    }
     
     IP_RATE_LIMIT = int(os.getenv('IP_RATE_LIMIT', '100'))
     IP_WINDOW = int(os.getenv('IP_WINDOW', '60'))
     TEMP_BAN_SECONDS = int(os.getenv('TEMP_BAN_SECONDS', '300'))
     BAN_MULTIPLIER = float(os.getenv('BAN_MULTIPLIER', '2'))
     
-    CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
+    CORS_ORIGINS = [o.strip() for o in os.getenv('CORS_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(',') if o.strip()]
     
     MAX_CONTENT_LENGTH = int(os.getenv('MAX_CONTENT_LENGTH', str(16 * 1024)))
     MAX_LOG_ENTRIES = int(os.getenv('MAX_LOG_ENTRIES', '1000'))
@@ -306,12 +335,18 @@ class JWTAuthManager:
             data = request.get_json()
             email = data.get('email')
             password = data.get('password')
+            organization_name = (data.get('organization_name') or 'Individual').strip()[:120]
             
             if not email or not password:
                 return jsonify({"error": "Email and password required"}), 400
             
-            # Hash password
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            if len(password) < 8:
+                return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+            if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email or ''):
+                return jsonify({"error": "Invalid email format"}), 400
+
+            password_hash = hash_password(password)
             
             conn = db_pool.get_connection()
             cursor = conn.cursor()
@@ -325,8 +360,8 @@ class JWTAuthManager:
                 # Create user
                 user_id = f"user_{secrets.token_urlsafe(16)}"
                 cursor.execute(
-                    "INSERT INTO auth_users (user_id, email, password_hash, tier) VALUES (?, ?, ?, ?)",
-                    (user_id, email, password_hash, 'free')
+                    "INSERT INTO auth_users (user_id, email, password_hash, tier, organization_name) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, email, password_hash, 'free', organization_name)
                 )
                 conn.commit()
                 
@@ -338,7 +373,8 @@ class JWTAuthManager:
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                     "user_id": user_id,
-                    "tier": "free"
+                    "tier": "free",
+                    "organization_name": organization_name
                 }), 201
                 
             except sqlite3.Error as e:
@@ -356,18 +392,21 @@ class JWTAuthManager:
             if not email or not password:
                 return jsonify({"error": "Email and password required"}), 400
             
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            
             conn = db_pool.get_connection()
             cursor = conn.cursor()
             
             try:
-                cursor.execute("SELECT * FROM auth_users WHERE email = ? AND password_hash = ?", 
-                             (email, password_hash))
+                cursor.execute("SELECT * FROM auth_users WHERE email = ?", (email,))
                 user = cursor.fetchone()
                 
-                if not user:
+                if not user or not verify_password(password, user['password_hash']):
                     return jsonify({"error": "Invalid credentials"}), 401
+
+                # Opportunistic migration from legacy SHA256 hash to bcrypt.
+                if not (user['password_hash'].startswith('$2a$') or user['password_hash'].startswith('$2b$') or user['password_hash'].startswith('$2y$')):
+                    upgraded_hash = hash_password(password)
+                    cursor.execute("UPDATE auth_users SET password_hash = ? WHERE user_id = ?", (upgraded_hash, user['user_id']))
+                    conn.commit()
                 
                 user_id = user['user_id']
                 tier = user['tier']
@@ -426,13 +465,18 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = Config.SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
 
-CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=True)
+CORS(app, origins=Config.CORS_ORIGINS, supports_credentials=False)
 socketio, _socketio_available = _init_socketio(app)
 
 jwt_manager = JWTAuthManager(secret_key=Config.SECRET_KEY, algorithm="HS256")
 app.config["JWT_MANAGER"] = jwt_manager
+email_notifier = EmailNotifier.from_env()
 
 print("✅ JWT Authentication initialized")
+if email_notifier.is_configured():
+    print("✅ Email notifications enabled")
+else:
+    print("ℹ️ Email notifications disabled or not configured")
 
 
 # DATABASE POOL
@@ -512,6 +556,7 @@ def ensure_db_schema() -> None:
         add_column_if_missing("auth_users", "email TEXT")
         add_column_if_missing("auth_users", "password_hash TEXT")
         add_column_if_missing("auth_users", "tier TEXT DEFAULT 'free'")
+        add_column_if_missing("auth_users", "organization_name TEXT DEFAULT 'Individual'")
         add_column_if_missing("auth_users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Users table (API keys)
@@ -542,6 +587,12 @@ def ensure_db_schema() -> None:
         add_column_if_missing("users", "blocked INTEGER DEFAULT 0")
         add_column_if_missing("users", "banned_until TEXT DEFAULT NULL")
         add_column_if_missing("users", "tier TEXT DEFAULT 'free'")
+        add_column_if_missing("users", "organization_name TEXT DEFAULT 'Individual'")
+        add_column_if_missing("users", "plan_start_date TEXT")
+        add_column_if_missing("users", "plan_end_date TEXT")
+        add_column_if_missing("users", "next_due_date TEXT")
+        add_column_if_missing("users", "amount_due REAL DEFAULT 0")
+        add_column_if_missing("users", "currency TEXT DEFAULT 'USD'")
         add_column_if_missing("users", "total_requests INTEGER DEFAULT 0")
         add_column_if_missing("users", "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         add_column_if_missing("users", "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
@@ -685,6 +736,29 @@ class SecurityUtils:
     def generate_api_key() -> str:
         """Generate new API key"""
         return f"rk_live_{secrets.token_urlsafe(32)}"
+
+
+def get_plan_profile(tier: str) -> Dict[str, Any]:
+    """Get pricing and billing defaults for tier."""
+    return Config.PLAN_PRICING.get(tier, Config.PLAN_PRICING['free'])
+
+
+def compute_plan_dates(tier: str) -> Tuple[str, str]:
+    """Compute plan end and due dates as YYYY-MM-DD."""
+    days = int(get_plan_profile(tier).get('days', 30))
+    end_date = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+    return end_date, end_date
+
+
+def days_left_from_date(date_str: Optional[str]) -> Optional[int]:
+    """Return days remaining until date_str (YYYY-MM-DD)."""
+    if not date_str:
+        return None
+    try:
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        return (target - datetime.utcnow().date()).days
+    except Exception:
+        return None
 
 
 # RATE LIMIT CACHE
@@ -883,6 +957,14 @@ def log_admin_action(action: str, target_api_key: Optional[str], admin_ip: str, 
         db_pool.return_connection(conn)
 
 
+def notify_event(event_type: str, payload: Dict[str, Any], subject: Optional[str] = None) -> None:
+    """Best-effort async notification wrapper."""
+    try:
+        email_notifier.send_notification(event_type, payload, subject=subject)
+    except Exception:
+        return None
+
+
 # USER MANAGEMENT (FIXED)
 
 def get_or_create_user(api_key: str) -> Optional[sqlite3.Row]:
@@ -905,12 +987,16 @@ def get_or_create_user(api_key: str) -> Optional[sqlite3.Row]:
             return user
         
         # Create new user
+        plan_end_date, next_due_date = compute_plan_dates('free')
+        profile = get_plan_profile('free')
         cursor.execute(
             """INSERT INTO users (api_key_hash, api_key_prefix, request_count, window_start_time, 
-                                  blocked, banned_until, tier) 
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                  blocked, banned_until, tier, organization_name, plan_start_date,
+                                  plan_end_date, next_due_date, amount_due, currency) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (api_key_hash, api_key_prefix, 0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-             0, None, 'free')
+             0, None, 'free', 'Individual', datetime.utcnow().strftime("%Y-%m-%d"),
+             plan_end_date, next_due_date, float(profile['amount_due']), profile['currency'])
         )
         conn.commit()
         
@@ -933,11 +1019,20 @@ def create_user_api_key(user_id: str, api_key: str, tier: str = 'free') -> None:
     try:
         api_key_hash = SecurityUtils.hash_api_key(api_key)
         api_key_prefix = SecurityUtils.get_api_key_prefix(api_key)
+        plan_end_date, next_due_date = compute_plan_dates(tier)
+        profile = get_plan_profile(tier)
+
+        cursor.execute("SELECT organization_name FROM auth_users WHERE user_id = ?", (user_id,))
+        auth_user = cursor.fetchone()
+        organization_name = auth_user['organization_name'] if auth_user and auth_user['organization_name'] else 'Individual'
         
         cursor.execute(
-            """INSERT INTO users (api_key_hash, api_key_prefix, user_id, tier) 
-               VALUES (?, ?, ?, ?)""",
-            (api_key_hash, api_key_prefix, user_id, tier)
+            """INSERT INTO users (api_key_hash, api_key_prefix, user_id, tier, organization_name,
+                                  plan_start_date, plan_end_date, next_due_date, amount_due, currency) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (api_key_hash, api_key_prefix, user_id, tier, organization_name,
+             datetime.utcnow().strftime("%Y-%m-%d"), plan_end_date, next_due_date,
+             float(profile['amount_due']), profile['currency'])
         )
         conn.commit()
     except sqlite3.Error as e:
@@ -991,6 +1086,15 @@ def ban_key(api_key: str) -> int:
         print(f"Error banning key: {str(e)}")
     finally:
         db_pool.return_connection(conn)
+
+    notify_event(
+        "api_key_temporary_ban",
+        {
+            "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key),
+            "ban_seconds": ban_seconds,
+        },
+        subject=f"[RateLimiter] API key temporarily banned: {SecurityUtils.get_api_key_prefix(api_key)}",
+    )
     
     return ban_seconds
 
@@ -1440,10 +1544,9 @@ jwt_manager.init_auth_endpoints(app)
 @app.route('/')
 def home():
     """Root endpoint"""
-    return jsonify({
+    payload = {
         "message": "🚀 COMPLETE FIXED Rate Limiter",
         "version": "2.0.0-fixed",
-        "test_key": SecurityUtils.generate_api_key(),
         "endpoints": {
             "auth_register": "/auth/register (POST)",
             "auth_login": "/auth/login (POST)",
@@ -1469,7 +1572,10 @@ def home():
             "Fixed user lookup to use direct hash matching",
             "All original features preserved"
         ]
-    })
+    }
+    if Config.DEBUG:
+        payload["test_key"] = SecurityUtils.generate_api_key()
+    return jsonify(payload)
 
 
 @app.route('/dashboard')
@@ -1541,6 +1647,19 @@ def get_data():
     
     if status == 429 and "retry_after_seconds" in body:
         headers["Retry-After"] = str(body["retry_after_seconds"])
+
+    if status == 429:
+        notify_event(
+            "rate_limit_exceeded",
+            {
+                "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key) if api_key else "none",
+                "endpoint": "/data",
+                "method": method,
+                "ip_hash": SecurityUtils.hash_ip(ip) if ip != "unknown" else "unknown",
+                "details": body,
+            },
+            subject="[RateLimiter] Rate limit exceeded",
+        )
 
     return jsonify(body), status, headers
 
@@ -1628,6 +1747,18 @@ def sdk_check():
             retry_after = limits['window']
             if isinstance(key_info, (int, float)):
                 retry_after = int(key_info)
+
+            notify_event(
+                "sdk_rate_limit_exceeded",
+                {
+                    "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key),
+                    "endpoint": endpoint,
+                    "method": "GET",
+                    "retry_after": retry_after,
+                    "ip_hash": SecurityUtils.hash_ip(request.remote_addr or "unknown"),
+                },
+                subject="[RateLimiter] SDK request blocked by rate limit",
+            )
             
             return jsonify({
                 'allowed': False,
@@ -1727,13 +1858,37 @@ def upgrade_tier():
     
     try:
         api_key_hash = SecurityUtils.hash_api_key(api_key)
-        cursor.execute("UPDATE users SET tier = ? WHERE api_key_hash = ?", (new_tier, api_key_hash))
+        plan_end_date, next_due_date = compute_plan_dates(new_tier)
+        profile = get_plan_profile(new_tier)
+        cursor.execute(
+            """UPDATE users SET tier = ?, plan_start_date = ?, plan_end_date = ?, next_due_date = ?,
+                          amount_due = ?, currency = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE api_key_hash = ?""",
+            (
+                new_tier,
+                datetime.utcnow().strftime("%Y-%m-%d"),
+                plan_end_date,
+                next_due_date,
+                float(profile['amount_due']),
+                profile['currency'],
+                api_key_hash
+            )
+        )
         
         if cursor.rowcount == 0:
             return jsonify({"error": "API key not found"}), 404
         
         conn.commit()
         log_admin_action('upgrade_tier', api_key, request.remote_addr, f"→ {new_tier}")
+        notify_event(
+            "tier_changed",
+            {
+                "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key),
+                "new_tier": new_tier,
+                "admin_ip_hash": SecurityUtils.hash_ip(request.remote_addr or "unknown"),
+            },
+            subject=f"[RateLimiter] Tier changed to {new_tier}",
+        )
         
         return jsonify({"status": "success", "new_tier": new_tier})
     finally:
@@ -1763,6 +1918,14 @@ def admin_block_key():
         
         conn.commit()
         log_admin_action('block_key', api_key, request.remote_addr, "Blocked")
+        notify_event(
+            "api_key_blocked",
+            {
+                "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key),
+                "admin_ip_hash": SecurityUtils.hash_ip(request.remote_addr or "unknown"),
+            },
+            subject=f"[RateLimiter] API key blocked: {SecurityUtils.get_api_key_prefix(api_key)}",
+        )
         
         return jsonify({"status": "success", "message": "Key blocked"})
     finally:
@@ -1799,6 +1962,14 @@ def admin_unblock_key():
             rate_limit_cache.key_ban_counts.pop(api_key_hash, None)
         
         log_admin_action('unblock_key', api_key, request.remote_addr, "Unblocked")
+        notify_event(
+            "api_key_unblocked",
+            {
+                "api_key_prefix": SecurityUtils.get_api_key_prefix(api_key),
+                "admin_ip_hash": SecurityUtils.hash_ip(request.remote_addr or "unknown"),
+            },
+            subject=f"[RateLimiter] API key unblocked: {SecurityUtils.get_api_key_prefix(api_key)}",
+        )
         
         return jsonify({"status": "success", "message": "Key unblocked"})
     finally:
@@ -1854,6 +2025,277 @@ def admin_audit():
             "audit_logs": [dict(log) for log in audit_logs],
             "count": len(audit_logs)
         })
+    finally:
+        db_pool.return_connection(conn)
+
+
+ADMIN_DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard</title>
+    <style>
+        body { font-family: Arial, Helvetica, sans-serif; background: #f5f7fb; margin: 0; color: #1f2937; }
+        .wrap { max-width: 1300px; margin: 24px auto; padding: 0 16px; }
+        .card { background: #fff; border: 1px solid #dce3ef; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+        h1 { margin: 0 0 8px 0; }
+        .muted { color: #6b7280; font-size: 14px; }
+        .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+        .stat { background: #f8fbff; border: 1px solid #dbeafe; border-radius: 12px; padding: 10px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 9px; }
+        th { background: #f9fafb; position: sticky; top: 0; }
+        .table-wrap { max-height: 65vh; overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px; }
+        .right { text-align: right; }
+        @media (max-width: 980px) { .stats { grid-template-columns: 1fr 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="card">
+            <h1>Admin Dashboard (No Security)</h1>
+            <p class="muted">Temporary open admin view. Shows users, organization, plan, rate limit, plan dates, days left, and amount due.</p>
+        </div>
+
+        <div class="card stats">
+            <div class="stat"><strong id="totalUsers">0</strong><div class="muted">Total Users</div></div>
+            <div class="stat"><strong id="activePlans">0</strong><div class="muted">Active Plans</div></div>
+            <div class="stat"><strong id="totalDue">0</strong><div class="muted">Total Due (USD)</div></div>
+            <div class="stat"><strong id="avgDaysLeft">0</strong><div class="muted">Avg Days Left</div></div>
+        </div>
+
+        <div class="card">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>User ID</th>
+                            <th>Email</th>
+                            <th>Organization</th>
+                            <th>Plan</th>
+                            <th>Rate Limit/min</th>
+                            <th>Days Left</th>
+                            <th>Plan Start</th>
+                            <th>Plan End</th>
+                            <th>Next Due Date</th>
+                            <th class="right">Amount Due</th>
+                            <th>Action</th>
+                            <th>Total Requests</th>
+                            <th>Blocked</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rows"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function saveRow(id) {
+            const orgEl = document.getElementById(`org-${id}`);
+            const dueEl = document.getElementById(`due-${id}`);
+            const amtEl = document.getElementById(`amt-${id}`);
+
+            const payload = {
+                id,
+                organization_name: orgEl ? orgEl.value : '',
+                next_due_date: dueEl ? dueEl.value : '',
+                amount_due: amtEl ? Number(amtEl.value || 0) : 0
+            };
+
+            const res = await fetch('/admin/dashboard/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                alert('Update failed: ' + (err.error || res.statusText));
+                return;
+            }
+
+            await loadDashboard();
+        }
+
+        async function loadDashboard() {
+            const res = await fetch('/admin/dashboard/data');
+            const data = await res.json();
+            const rows = document.getElementById('rows');
+            rows.innerHTML = '';
+
+            let totalDue = 0;
+            let activePlans = 0;
+            let daysSum = 0;
+            let daysCount = 0;
+
+            for (const u of data.users) {
+                totalDue += Number(u.amount_due || 0);
+                if (u.plan_end_date) activePlans += 1;
+                if (typeof u.days_left === 'number') {
+                    daysSum += u.days_left;
+                    daysCount += 1;
+                }
+
+                const esc = (v) => String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${esc(u.user_id || '-')}</td>
+                    <td>${esc(u.email || '-')}</td>
+                    <td><input id="org-${u.id}" value="${esc(u.organization_name || 'Individual')}" style="width:180px"></td>
+                    <td>${esc(u.plan)}</td>
+                    <td>${Number(u.rate_limit_per_minute || 0)}</td>
+                    <td>${u.days_left ?? '-'}</td>
+                    <td>${esc(u.plan_start_date || '-')}</td>
+                    <td>${esc(u.plan_end_date || '-')}</td>
+                    <td><input id="due-${u.id}" type="date" value="${esc(u.next_due_date || '')}"></td>
+                    <td class="right"><input id="amt-${u.id}" type="number" min="0" step="0.01" value="${Number(u.amount_due || 0).toFixed(2)}" style="width:110px"> ${u.currency || 'USD'}</td>
+                    <td><button onclick="saveRow(${u.id})">Save</button></td>
+                    <td>${u.total_requests}</td>
+                    <td>${u.blocked ? 'Yes' : 'No'}</td>
+                `;
+                rows.appendChild(tr);
+            }
+
+            document.getElementById('totalUsers').textContent = data.users.length;
+            document.getElementById('activePlans').textContent = activePlans;
+            document.getElementById('totalDue').textContent = totalDue.toFixed(2);
+            document.getElementById('avgDaysLeft').textContent = daysCount ? (daysSum / daysCount).toFixed(1) : '0';
+        }
+
+        loadDashboard();
+    </script>
+</body>
+</html>
+'''
+
+
+@app.route('/admin/dashboard')
+@require_admin_auth
+@rate_limit_endpoint(max_requests=30, window=60)
+def admin_dashboard_open():
+    """Admin dashboard page."""
+    return render_template_string(ADMIN_DASHBOARD_HTML)
+
+
+@app.route('/admin/dashboard/data')
+@require_admin_auth
+@rate_limit_endpoint(max_requests=60, window=60)
+def admin_dashboard_data_open():
+    """Admin dashboard data endpoint."""
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                u.id,
+                u.user_id,
+                au.email,
+                COALESCE(u.organization_name, au.organization_name, 'Individual') AS organization_name,
+                u.api_key_prefix,
+                u.tier,
+                u.total_requests,
+                u.blocked,
+                u.plan_start_date,
+                u.plan_end_date,
+                u.next_due_date,
+                u.amount_due,
+                u.currency,
+                u.created_at,
+                u.updated_at
+            FROM users u
+            LEFT JOIN auth_users au ON au.user_id = u.user_id
+            ORDER BY u.updated_at DESC
+            """
+        )
+        rows = cursor.fetchall()
+
+        users = []
+        for row in rows:
+            tier = row['tier'] or 'free'
+            limits = Config.RATE_LIMITS.get(tier, Config.RATE_LIMITS['free'])
+            profile = get_plan_profile(tier)
+            plan_start_date = row['plan_start_date'] or datetime.utcnow().strftime("%Y-%m-%d")
+            plan_end_date = row['plan_end_date']
+            next_due_date = row['next_due_date']
+            if not plan_end_date or not next_due_date:
+                computed_end, computed_due = compute_plan_dates(tier)
+                plan_end_date = plan_end_date or computed_end
+                next_due_date = next_due_date or computed_due
+            users.append({
+                'id': row['id'],
+                'user_id': row['user_id'],
+                'email': row['email'],
+                'organization_name': row['organization_name'] or 'Individual',
+                'api_key_prefix': row['api_key_prefix'],
+                'plan': tier,
+                'rate_limit_per_minute': limits['requests'],
+                'days_left': days_left_from_date(plan_end_date),
+                'plan_start_date': plan_start_date,
+                'plan_end_date': plan_end_date,
+                'next_due_date': next_due_date,
+                'amount_due': float(row['amount_due'] if row['amount_due'] is not None else profile['amount_due']),
+                'currency': row['currency'] or 'USD',
+                'total_requests': row['total_requests'] or 0,
+                'blocked': bool(row['blocked']),
+                'created_at': row['created_at'],
+                'updated_at': row['updated_at'],
+            })
+
+        return jsonify({'users': users, 'count': len(users)})
+    finally:
+        db_pool.return_connection(conn)
+
+
+@app.route('/admin/dashboard/update', methods=['POST'])
+@require_admin_auth
+@rate_limit_endpoint(max_requests=60, window=60)
+def admin_dashboard_update_open():
+    """Admin dashboard update endpoint."""
+    data = request.get_json() or {}
+    user_row_id = data.get('id')
+    organization_name = (data.get('organization_name') or 'Individual').strip()[:120]
+    next_due_date = (data.get('next_due_date') or '').strip()
+    amount_due = data.get('amount_due', 0)
+
+    if not user_row_id:
+        return jsonify({'error': 'id is required'}), 400
+
+    try:
+        amount_due = float(amount_due)
+    except Exception:
+        return jsonify({'error': 'amount_due must be a number'}), 400
+
+    if amount_due < 0:
+        return jsonify({'error': 'amount_due must be >= 0'}), 400
+
+    if next_due_date:
+        try:
+            datetime.strptime(next_due_date, "%Y-%m-%d")
+        except Exception:
+            return jsonify({'error': 'next_due_date must be YYYY-MM-DD'}), 400
+
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE users
+            SET organization_name = ?, next_due_date = ?, amount_due = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (organization_name, next_due_date or None, amount_due, user_row_id)
+        )
+        if cursor.rowcount == 0:
+            return jsonify({'error': 'user record not found'}), 404
+
+        conn.commit()
+        return jsonify({'status': 'success'})
     finally:
         db_pool.return_connection(conn)
 
@@ -1957,4 +2399,10 @@ if __name__ == '__main__':
     print("🧪 Test: curl 'http://localhost:5000/data?api_key=test-key-123'")
     print("\n" + "="*80 + "\n")
     
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app,
+        debug=Config.DEBUG,
+        host='0.0.0.0',
+        port=5000,
+        allow_unsafe_werkzeug=Config.DEBUG
+    )
