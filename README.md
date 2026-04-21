@@ -1,35 +1,58 @@
-# API Rate Limiter + Load Balancer
+# API Rate Limiter
 
- API infrastructure with:
+Production-style API rate limiter project with JWT auth, admin controls, SDK integration, mock backends, and an optional load balancer.
 
-- Rate limiting (tier-based + per-IP controls)
-- JWT authentication and token refresh
-- Admin controls (tier upgrades, block/unblock, logs, audit)
-- Browser SDK (`/sdk.js`) and SDK setup page (`/sdk`)
-- Load balancer with strategy switching and health checks
-- Mock backends for local end-to-end testing
+## What this project does
 
-## Current Architecture
+- Protects API endpoints with tier-based limits.
+- Supports register/login/refresh authentication flow.
+- Supports API key creation and usage tracking.
+- Provides admin actions for user tier upgrades and key blocking.
+- Includes a browser SDK (`/sdk.js`) and demo/setup page (`/sdk`).
+- Includes a standalone load balancer and geo-routing modules for advanced routing experiments.
+
+## Premium / Paid section
+
+Short answer: there is no paid billing or subscription system implemented.
+
+- The code has tier names: `free`, `basic`, `premium`, and `enterprise`.
+- These tiers are technical rate-limit levels, not a payment gateway integration.
+- No Stripe/PayPal/subscription checkout logic is included in this repository.
+- Tier changes are done through app logic/admin endpoints (for example `/admin/upgrade_tier`).
+
+## Project architecture
 
 ```text
 Client
-  -> Rate Limiter (Flask, :5000)
-      -> optional: Load Balancer (aiohttp, :8080)
-          -> Backend servers (:5001, :5002, :5003)
+  -> Main API (Flask, default :5000)
+       -> SQLite or PostgreSQL schema support
+       -> optional SDK endpoints and dashboard
+  -> optional Load Balancer (aiohttp, default :8080)
+       -> Mock backends (:5001, :5002, :5003)
 ```
 
-## What Is In This Repo
+## Full file inventory (what each file does)
 
-- `app.py`: Main rate limiter API + auth + admin + dashboard + SDK routes
-- `auth.py`: JWT auth manager utilities
-- `load_balancer.py`: Async load balancer + dashboard + strategy control
-- `mock_backends.py`: Local backend simulators
-- `run_system.py`: One-command orchestrator
-- `database.py`: SQLite migration/check helper
-- `static/demo.html`: SDK setup/demo web page (served at `/sdk`)
-- `static/ratelimiter-sdk.js`: Browser SDK (served at `/sdk.js`)
+| File | Purpose |
+|---|---|
+| `app.py` | Main Flask application. Includes auth routes, protected data routes, usage routes, admin routes, dashboard HTML, SDK routes (`/sdk`, `/sdk.js`, `/sdk/check`, `/sdk/track`), metrics, and core rate-limit logic. |
+| `auth.py` | JWT auth manager module. Handles token generation, verification, refresh, revocation, decorators for protected routes, and auth endpoint initialization helpers. |
+| `database.py` | Database setup/migration helper for SQLite schema and maintenance tasks (backup, schema checks, updates). |
+| `geo_router.py` | Geographic routing utilities. Resolves IP geolocation and selects nearest datacenter/backends. Useful with multi-region routing setups. |
+| `load_balancer.py` | Async load balancer service with multiple balancing strategies (round robin, least connections, weighted, IP hash, adaptive), health checks, and dashboard/stats endpoints. |
+| `log_manager.py` | Logging and abuse-detection utilities used by system components. Supports request logging, suspicious pattern detection, and log file management. |
+| `mock_backends.py` | Runs mock backend Flask servers for local testing of routing and load-balancing behavior. |
+| `run_system.py` | One-command orchestrator for local end-to-end startup (checks deps, starts components, monitors processes, graceful shutdown). |
+| `ssl_setup.py` | SSL/TLS helper for generating self-signed certs and production SSL guidance/validation. |
+| `setup_postgress.sql` | PostgreSQL schema/setup script (database, users, tables, indexes). Note: filename is intentionally `postgress` in this repo. |
+| `requirements.txt` | Python dependency list for API app, auth/security, async networking, optional DB/metrics/testing/dev tooling. |
+| `Dockerfile` | Container build definition. Installs dependencies and runs app with gunicorn on port 8000. |
+| `railway.toml` | Railway deployment config using nixpacks and gunicorn start command. |
+| `static/demo.html` | Browser demo page for connecting and testing SDK behavior against the backend. |
+| `static/ratelimiter-sdk.js` | Client-side SDK that checks limits before requests, tracks calls, and can show usage widgets/errors. |
+| `README.md` | Project documentation (this file). |
 
-## Quick Start
+## Quick start
 
 ### 1) Install dependencies
 
@@ -37,27 +60,27 @@ Client
 pip install -r requirements.txt
 ```
 
-### 2) Start everything (recommended)
+### 2) Start full local system (recommended)
 
 ```bash
 python run_system.py --dev --skip-db
 ```
 
-This starts:
+Typical local ports:
 
-- Main app on `http://localhost:5000`
-- Load balancer on `http://localhost:8080`
-- Mock backends on `http://localhost:5001..5003`
+- Main API: `http://localhost:5000`
+- Load balancer: `http://localhost:8080`
+- Mock backends: `http://localhost:5001`, `:5002`, `:5003`
 
-### 3) Open UIs
+### 3) Open useful pages
 
-- Rate limiter dashboard: `http://localhost:5000/dashboard`
+- API dashboard/docs: `http://localhost:5000/dashboard`
 - SDK setup/demo page: `http://localhost:5000/sdk`
 - Load balancer dashboard: `http://localhost:8080/dashboard`
 
-## Manual Startup (Alternative)
+## Manual startup (alternative)
 
-Start in separate terminals:
+Run each component in separate terminals:
 
 ```bash
 python mock_backends.py
@@ -65,22 +88,21 @@ python load_balancer.py
 python app.py
 ```
 
-## API Overview
+## Main endpoints
 
-### Rate Limiter (`:5000`)
+### Core API (`:5000`)
 
-| Method | Endpoint | Purpose |
+| Method | Endpoint | Description |
 |---|---|---|
-| GET | `/` | Service info JSON |
-| GET | `/dashboard` | Human-friendly docs/dashboard |
-| GET | `/health` | Health check |
-| GET | `/api/metrics` | Realtime counters |
-| GET | `/data?api_key=KEY` | Protected example endpoint |
-| GET | `/usage?api_key=KEY` | Usage/limit status |
-| GET | `/sdk` | SDK web setup page |
+| GET | `/` | API info/health-style summary JSON |
+| GET | `/dashboard` | Human-readable dashboard/docs page |
+| GET | `/data?api_key=KEY` | Protected sample data endpoint |
+| GET | `/usage?api_key=KEY` | Current usage and limits for API key |
+| GET | `/api/metrics` | Runtime metrics |
+| GET | `/sdk` | SDK setup/demo page |
 | GET | `/sdk.js` | Browser SDK script |
-| POST | `/sdk/check` | SDK preflight check |
-| POST | `/sdk/track` | SDK request tracking |
+| POST | `/sdk/check` | SDK pre-request allow/deny check |
+| POST | `/sdk/track` | SDK request tracking endpoint |
 
 ### Authentication (`:5000`)
 
@@ -106,104 +128,45 @@ Admin endpoints require `Authorization: Bearer <ADMIN_TOKEN>`.
 | GET | `/logs` |
 | GET | `/admin/audit` |
 
-### Load Balancer (`:8080`)
+### Load balancer (`:8080`)
 
-| Method | Endpoint | Purpose |
+| Method | Endpoint | Description |
 |---|---|---|
 | GET | `/dashboard` | Load balancer UI |
-| GET | `/stats` | Current backend/cache stats |
-| POST | `/change_strategy` | Switch strategy |
-| ANY | `/{path:.*}` | Proxy traffic to selected backend |
+| GET | `/stats` | Backend/cache/load stats |
+| POST | `/change_strategy` | Switch balancing strategy |
+| ANY | `/{path:.*}` | Proxy requests to selected backend |
 
-## Auth Flow Example
+## Tier limits
 
-### Register
+Configured in application logic:
 
-```bash
-curl -X POST http://localhost:5000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "user@example.com",
-    "password": "secure_password",
-    "tier": "free"
-  }'
-```
+- `free`: 5 requests/minute
+- `basic`: 20 requests/minute
+- `premium`: 100 requests/minute
+- `enterprise`: 1000 requests/minute
 
-### Login
+These are technical limits and not connected to a payment processor by default.
 
-```bash
-curl -X POST http://localhost:5000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "user@example.com",
-    "password": "secure_password"
-  }'
-```
+## Database notes
 
-Token expiry defaults:
+- Default local storage is SQLite (`ratelimiter.db`).
+- PostgreSQL schema/bootstrap SQL is available in `setup_postgress.sql`.
 
-- Access token: 1 hour
-- Refresh token: 7 days
-
-### Create API key (JWT)
+Helpful DB commands:
 
 ```bash
-curl -X POST http://localhost:5000/auth/create_api_key \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+python database.py
+python database.py check
+python database.py verify
 ```
 
-## SDK Usage
+## Deployment notes
 
-### Option A: Use SDK setup page
+- Docker: use `Dockerfile` (gunicorn serves `app:app` on port 8000).
+- Railway: see `railway.toml` for build/start settings.
 
-Open `http://localhost:5000/sdk` and use the UI guide.
-
-### Option B: Script integration
-
-```html
-<script src="http://localhost:5000/sdk.js"></script>
-<script>
-  RateLimiter.init({
-    apiKey: 'YOUR_API_KEY',
-    backendUrl: 'http://localhost:5000',
-    showWidget: true,
-    showGuideButton: true
-  });
-</script>
-```
-
-### Optional: Route traffic via your gateway
-
-```javascript
-RateLimiter.init({
-  apiKey: 'YOUR_API_KEY',
-  backendUrl: 'http://localhost:5000',
-  routeTrafficTo: 'http://localhost:5000'
-});
-```
-
-Notes:
-
-- `backendUrl` is for SDK control endpoints (`/sdk/check`, `/sdk/track`, `/usage`).
-- `routeTrafficTo` rewrites outgoing request URLs to your chosen base URL.
-
-## Database Notes
-
-Default development database is SQLite (`ratelimiter.db`).
-
-Use helper commands:
-
-```bash
-python database.py          # migrate/update schema
-python database.py check    # inspect schema
-python database.py verify   # integrity checks
-```
-
-PostgreSQL setup script exists at `setup_postgress.sql` for environments where you want to prepare a PostgreSQL schema manually.
-
-## Configuration
-
-Common environment variables:
+## Environment variables (common)
 
 - `JWT_SECRET_KEY`
 - `ADMIN_TOKEN`
@@ -218,28 +181,9 @@ Common environment variables:
 
 ## Troubleshooting
 
-### Port already in use
-
-- Stop existing processes or change ports before startup.
-
-### SDK page loads but SDK script is old
-
-- Use `GET /sdk.js` from this app instance (it serves `static/ratelimiter-sdk.js`).
-
-### Database schema errors
-
-```bash
-python database.py
-```
-
-### JWT errors
-
-- Ensure `Authorization` header uses `Bearer <token>`.
-- Verify secret key is consistent for all app instances.
-
-### Load balancer returns backend errors
-
-- Confirm mock backends are running on `:5001..5003`.
-- Check LB stats at `http://localhost:8080/stats`.
+- If a port is busy, stop old processes or change the port config.
+- If SDK behavior seems old, confirm you are loading `/sdk.js` from the current running app.
+- If auth fails, verify `Authorization: Bearer <token>` format and JWT secret consistency.
+- If load balancer fails, verify mock backends are running on ports `5001-5003`.
 
 
