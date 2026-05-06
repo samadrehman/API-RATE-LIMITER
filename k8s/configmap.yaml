@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-rate-limiter-config
+data:
+  FLASK_ENV: "production"
+  DB_PATH: "/app/data/ratelimiter.db"
+  IP_RATE_LIMIT: "100"
+  IP_WINDOW: "60"
+  TEMP_BAN_SECONDS: "300"
+  BAN_MULTIPLIER: "2"
+  CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+  ENABLE_SOCKETIO: "false"
+  MAX_CONTENT_LENGTH: "16384"
+  FLASK_DEBUG: "false"

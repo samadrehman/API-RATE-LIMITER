@@ -1,0 +1,38 @@
+version: '3.9'
+
+services:
+  api:
+    build: .
+    container_name: api-rate-limiter
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./ratelimiter.db:/app/ratelimiter.db
+    environment:
+      - DB_PATH=/app/ratelimiter.db
+      - FLASK_ENV=production
+      - ENABLE_SOCKETIO=false
+    restart: unless-stopped
+
+  load_balancer:
+    build: .
+    container_name: api-rate-limiter-load-balancer
+    command: ["python", "load_balancer.py"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  mock_backends:
+    build: .
+    container_name: api-rate-limiter-backends
+    command: ["python", "mock_backends.py"]
+    ports:
+      - "5001:5001"
+      - "5002:5002"
+      - "5003:5003"
+    restart: unless-stopped
